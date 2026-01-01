@@ -1,13 +1,14 @@
 import json, threading, time, websocket, numpy as np
 from collections import deque
-import sys
+import sys, os
 from rich.console import Console
 from rich.table import Table
 from rich.live import Live
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # ================= CONFIG =================
-API_TOKEN = "eZjDrK54yMTAsbf"
-APP_ID = 112380
+API_TOKEN = os.getenv("DERIV_API_TOKEN")  # from Render env vars
+APP_ID = int(os.getenv("APP_ID"))         # from Render env vars
 SYMBOL = "R_75"
 
 BASE_STAKE = 1.0
@@ -39,9 +40,6 @@ trade_in_progress = False
 last_trade_time = 0
 last_proposal_time = 0
 last_direction = None
-authorized = False
-ws_running = False
-ws = None
 stop_bot = False
 lock = threading.Lock()
 
@@ -69,18 +67,8 @@ class OnlineLearner:
 learner = OnlineLearner(n_features=4)
 
 # ================= UTILITIES =================
-def listen_for_stop():
-    global stop_bot
-    console.print("[bold red]Press ENTER to STOP the bot[/bold red]")
-    input()
-    stop_bot = True
-    console.print("[bold red]🚨 BOT STOPPED BY USER[/bold red]")
-
-threading.Thread(target=listen_for_stop, daemon=True).start()
-
 def calculate_ema(data, period):
-    if len(data) < period:
-        return None
+    if len(data) < period: return None
     weights = np.exp(np.linspace(-1., 0., period))
     weights /= weights.sum()
     return np.convolve(data[-period:], weights, mode="valid")[0]
@@ -93,14 +81,12 @@ def calculate_dynamic_stake(confidence):
 
 def check_trade_memory(direction):
     global last_direction
-    if direction == last_direction:
-        return False
+    if direction == last_direction: return False
     last_direction = direction
     return True
 
 def extract_features():
-    if len(tick_buffer) < MICRO_SLICE:
-        return None
+    if len(tick_buffer) < MICRO_SLICE: return None
     arr = np.array(tick_buffer)
     short_ema = calculate_ema(arr, EMA_FAST)
     long_ema = calculate_ema(arr, EMA_SLOW)
@@ -120,11 +106,9 @@ def evaluate_and_trade():
     features = extract_features()
     if features is None: return
 
-    # Self-learning prediction
     direction = "up" if learner.predict(features) == 1 else "down"
     confidence = 0.7
 
-    # EMA filter
     short_ema, long_ema = features[0], features[1]
     ema_trend = "up" if short_ema > long_ema else "down"
     if direction != ema_trend: return
@@ -203,11 +187,9 @@ def resubscribe_channels():
     ws.send(json.dumps({"proposal_open_contract":1,"subscribe":1}))
 
 def start_ws():
-    global ws, ws_running
-    if ws_running: return
-    ws_running=True
+    global ws
     ws=websocket.WebSocketApp(
-        DERIV_WS,
+        f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}",
         on_open=lambda ws: ws.send(json.dumps({"authorize":API_TOKEN})),
         on_message=on_message
     )
@@ -215,7 +197,7 @@ def start_ws():
 
 # ================= DASHBOARD =================
 def render_dashboard():
-    table = Table(title="67EXPANSION3 - Professional Dashboard", show_lines=True)
+    table = Table(title="Momento Bot Dashboard", show_lines=True)
     table.add_column("Metric", style="cyan")
     table.add_column("Value", style="magenta")
     table.add_row("Balance", f"{BALANCE:.2f} USD")
@@ -233,6 +215,22 @@ def dashboard_loop():
             time.sleep(0.5)
             live.update(render_dashboard())
 
+# ================= KEEP BOT ALIVE =================
+class KeepAliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type","text/plain")
+        self.end_headers()
+        self.wfile.write(b"Momento Bot is alive!")
+
+def run_keep_alive_server():
+    port = int(os.getenv("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
+    console.print(f"[bold green]🟢 Keep-alive server running on port {port}[/bold green]")
+    server.serve_forever()
+
+threading.Thread(target=run_keep_alive_server, daemon=True).start()
+
 # ================= START BOT =================
 def start():
     start_ws()
@@ -241,5 +239,5 @@ def start():
         time.sleep(1)
 
 if __name__=="__main__":
-    console.print("[bold green]🚀 Bot started on Termux[/bold green]")
+    console.print("[bold green]🚀 Momento Bot started[/bold green]")
     start()
