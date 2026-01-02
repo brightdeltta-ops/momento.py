@@ -1,4 +1,8 @@
-import json, threading, time, websocket, numpy as np
+import json
+import threading
+import time
+import websocket
+import numpy as np
 from collections import deque
 import os
 from rich.console import Console
@@ -6,14 +10,13 @@ from rich.table import Table
 from rich.live import Live
 
 # ================= CONFIG =================
-API_TOKEN = os.getenv("API_TOKEN")
+API_TOKEN = os.getenv("DERIV_API_TOKEN")  # Must match Koyeb env var
 APP_ID = int(os.getenv("APP_ID", "0"))
 
 if not API_TOKEN or not APP_ID:
-    raise RuntimeError("Missing API_TOKEN or APP_ID environment variables")
+    raise RuntimeError("Missing DERIV_API_TOKEN or APP_ID environment variables")
 
 SYMBOL = "R_75"
-
 BASE_STAKE = 1.0
 MAX_STAKE = 100.0
 TRADE_RISK_FRAC = 0.02
@@ -43,12 +46,10 @@ trade_in_progress = False
 last_proposal_time = 0
 last_direction = None
 stop_bot = False
-
 ws = None
 lock = threading.Lock()
 
 DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-
 console = Console()
 
 # ================= ONLINE LEARNER =================
@@ -200,7 +201,7 @@ def start_ws():
     global ws
     ws = websocket.WebSocketApp(
         DERIV_WS,
-        on_open=lambda w: w.send(json.dumps({"authorize": API_TOKEN})),
+        on_open=lambda w: ws.send(json.dumps({"authorize": API_TOKEN})),
         on_message=on_message
     )
     threading.Thread(target=ws.run_forever, daemon=True).start()
@@ -209,7 +210,7 @@ def start_ws():
 def dashboard_loop():
     with Live(auto_refresh=True) as live:
         while True:
-            table = Table(title="Momento Bot")
+            table = Table(title="Momento Bot Dashboard")
             table.add_column("Metric")
             table.add_column("Value")
             table.add_row("Balance", f"{BALANCE:.2f}")
