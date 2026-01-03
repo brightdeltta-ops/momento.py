@@ -5,14 +5,13 @@ from rich.table import Table
 from rich.live import Live
 
 # ================= CONFIG =================
-API_TOKEN = os.getenv("DERIV_API_TOKEN")  # must match environment variable
+API_TOKEN = os.getenv("DERIV_API_TOKEN")
 APP_ID = int(os.getenv("APP_ID", "0"))
 
 if not API_TOKEN or not APP_ID:
-    raise RuntimeError("Missing API_TOKEN or APP_ID environment variables")
+    raise RuntimeError("Missing DERIV_API_TOKEN or APP_ID environment variables")
 
 SYMBOL = "R_75"
-
 BASE_STAKE = 1.0
 MAX_STAKE = 100.0
 TRADE_RISK_FRAC = 0.02
@@ -29,7 +28,6 @@ MAX_DD = 0.2
 tick_history = deque(maxlen=500)
 tick_buffer = deque(maxlen=MICRO_SLICE)
 trade_queue = deque(maxlen=30)
-recent_signals = deque(maxlen=10)
 trade_log = deque(maxlen=5)
 
 BALANCE = 0.0
@@ -38,7 +36,6 @@ WINS = 0
 LOSSES = 0
 TRADE_COUNT = 0
 TRADE_AMOUNT = BASE_STAKE
-
 trade_in_progress = False
 last_proposal_time = 0
 last_direction = None
@@ -46,7 +43,6 @@ stop_bot = False
 
 ws = None
 lock = threading.Lock()
-DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 console = Console()
 
 # ================= ONLINE LEARNER =================
@@ -110,13 +106,9 @@ def record_trade_log(direction, stake, confidence, profit):
 # ================= TRADING =================
 def evaluate_and_trade():
     global last_proposal_time, TRADE_AMOUNT
-    if stop_bot:
+    if stop_bot or time.time() - last_proposal_time < PROPOSAL_COOLDOWN:
         return
-    if time.time() - last_proposal_time < PROPOSAL_COOLDOWN:
-        return
-    if not session_loss_check():
-        return
-    if len(tick_history) < VOLATILITY_WINDOW:
+    if not session_loss_check() or len(tick_history) < VOLATILITY_WINDOW:
         return
     if np.array(list(tick_history)[-VOLATILITY_WINDOW:]).std() < VOLATILITY_THRESHOLD:
         return
@@ -127,9 +119,7 @@ def evaluate_and_trade():
 
     direction = "up" if learner.predict(features) == 1 else "down"
     ema_trend = "up" if features[0] > features[1] else "down"
-    if direction != ema_trend:
-        return
-    if not check_trade_memory(direction):
+    if direction != ema_trend or not check_trade_memory(direction):
         return
 
     confidence = 0.7
@@ -157,7 +147,7 @@ def send_proposal(direction, duration, stake):
         "duration_unit": "t",
         "symbol": SYMBOL
     }))
-    console.log(f"[bold magenta]📤 Proposal sent {ct} ${stake:.2f}[/bold magenta]")
+    console.log(f"[magenta]📤 Proposal sent {ct} ${stake:.2f}[/magenta]")
     trade_in_progress = True
 
 def on_contract_settlement(c):
@@ -169,54 +159,73 @@ def on_contract_settlement(c):
     LOSSES += profit <= 0
     TRADE_COUNT += 1
     trade_in_progress = False
-
-    # Record last trade log
-    last_trade = trade_queue[0] if trade_queue else (last_direction, TRADE_AMOUNT, 0.7)
-    record_trade_log(last_trade[0], last_trade[2], 0.7, profit)
-    console.log(f"[bold green]📊 Trade closed | PnL={profit:.2f} | Bal={BALANCE:.2f}[/bold green]")
+    record_trade_log(last_direction or "N/A", TRADE_AMOUNT, 0.7, profit)
 
     features = extract_features()
     if features is not None:
         learner.update(features, profit)
 
-# ================= WEBSOCKET =================
-def on_message(ws, msg):
-    try:
-        data = json.loads(msg)
-        if "authorize" in data:
-            resubscribe()
-        if "tick" in data:
-            tick = float(data["tick"]["quote"])
-            tick_history.append(tick)
-            tick_buffer.append(tick)
-            evaluate_and_trade()
-        if "proposal" in data:
-            time.sleep(PROPOSAL_DELAY)
-            ws.send(json.dumps({"buy": data["proposal"]["id"], "price": TRADE_AMOUNT}))
-        if "proposal_open_contract" in data:
-            c = data["proposal_open_contract"]
-            if c.get("is_sold") or c.get("is_expired"):
-                on_contract_settlement(c)
-        if "balance" in data:
-            global BALANCE
-            BALANCE = float(data["balance"]["balance"])
-    except Exception as e:
-        console.log(f"[red]Error in on_message:[/red] {e}")
+    console.log(f"[cyan]📊 Trade closed | PnL={profit:.2f} | Bal={BALANCE:.2f}[/cyan]")
 
+# ================= WEBSOCKET =================
 def resubscribe():
     ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
     ws.send(json.dumps({"balance": 1, "subscribe": 1}))
     ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
+    console.log("[green]Subscribed to ticks, balance, contracts[/green]")
 
 def start_ws():
     global ws
+    DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+    console.log(f"[yellow]Connecting to Deriv WebSocket at {DERIV_WS}[/yellow]")
+
+    def on_open(w):
+        console.log("[green]WebSocket connected[/green]")
+        w.send(json.dumps({"authorize": API_TOKEN}))
+
+    def on_message(ws, msg):
+        try:
+            data = json.loads(msg)
+            if "authorize" in data:
+                if data["authorize"].get("error"):
+                    console.log(f"[red]Auth failed: {data['authorize']['error']}[/red]")
+                else:
+                    console.log("[green]✅ Authorized[/green]")
+                    resubscribe()
+            if "tick" in data:
+                tick = float(data["tick"]["quote"])
+                tick_history.append(tick)
+                tick_buffer.append(tick)
+                console.log(f"[cyan]TICK {tick}[/cyan]")
+                evaluate_and_trade()
+            if "proposal" in data:
+                time.sleep(PROPOSAL_DELAY)
+                ws.send(json.dumps({"buy": data["proposal"]["id"], "price": TRADE_AMOUNT}))
+            if "proposal_open_contract" in data:
+                c = data["proposal_open_contract"]
+                if c.get("is_sold") or c.get("is_expired"):
+                    on_contract_settlement(c)
+            if "balance" in data:
+                global BALANCE
+                BALANCE = float(data["balance"]["balance"])
+        except Exception as e:
+            console.log(f"[red]on_message error: {e}[/red]")
+
+    def on_error(ws, error):
+        console.log(f"[red]WebSocket ERROR: {error}[/red]")
+
+    def on_close(ws, code, msg):
+        console.log(f"[red]WebSocket closed | Code: {code} | Msg: {msg}[/red]")
+
     ws = websocket.WebSocketApp(
         DERIV_WS,
-        on_open=lambda w: w.send(json.dumps({"authorize": API_TOKEN})),
-        on_message=on_message
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
     )
+
     threading.Thread(target=ws.run_forever, daemon=True).start()
-    console.log("[bold green]🔗 WebSocket connected[/bold green]")
 
 # ================= DASHBOARD =================
 def dashboard_loop():
@@ -226,14 +235,13 @@ def dashboard_loop():
             table.add_column("Metric", justify="left")
             table.add_column("Value", justify="right")
 
-            # Main stats
             table.add_row("Balance", f"{BALANCE:.2f}")
             table.add_row("Max Balance", f"{MAX_BALANCE:.2f}")
             table.add_row("Trades", str(TRADE_COUNT))
             table.add_row("Wins", str(WINS))
             table.add_row("Losses", str(LOSSES))
 
-            # Last 5 trades
+            # Last trades
             table.add_section()
             table.add_row("[bold]Last Trades[/bold]", "")
             trade_table = Table()
@@ -243,26 +251,15 @@ def dashboard_loop():
             trade_table.add_column("Profit")
             for t in trade_log:
                 trade_table.add_row(t["Direction"], t["Stake"], t["Confidence"], t["Profit"])
-
             table.add_row("", trade_table)
+
             live.update(table)
             time.sleep(1)
-
-# ================= HEARTBEAT =================
-def heartbeat_loop():
-    while True:
-        with lock:
-            bal_color = "green" if BALANCE >= MAX_BALANCE else "yellow"
-            console.print(f"[bold cyan]❤️ HEARTBEAT | "
-                          f"Bal=[{bal_color}]{BALANCE:.2f}[/{bal_color}] "
-                          f"Trades={TRADE_COUNT} W/L={WINS}/{LOSSES}[/bold cyan]")
-        time.sleep(60)
 
 # ================= START =================
 if __name__ == "__main__":
     console.print("[green]🚀 Momento Bot starting on Koyeb[/green]")
     start_ws()
     threading.Thread(target=dashboard_loop, daemon=True).start()
-    threading.Thread(target=heartbeat_loop, daemon=True).start()
     while True:
         time.sleep(5)
