@@ -3,11 +3,9 @@ from collections import deque
 from rich.console import Console
 from rich.table import Table
 from rich.live import Live
-from rich.progress import BarColumn, Progress, TextColumn
-from rich.text import Text
 
 # ================= CONFIG =================
-API_TOKEN = os.getenv("API_TOKEN")
+API_TOKEN = os.getenv("DERIV_API_TOKEN")  # Match your environment variable
 APP_ID = int(os.getenv("APP_ID", "0"))
 
 if not API_TOKEN or not APP_ID:
@@ -31,7 +29,8 @@ MAX_DD = 0.2
 tick_history = deque(maxlen=500)
 tick_buffer = deque(maxlen=MICRO_SLICE)
 trade_queue = deque(maxlen=30)
-balance_history = deque(maxlen=50)  # for sparkline
+recent_signals = deque(maxlen=10)
+trade_log = deque(maxlen=5)
 
 BALANCE = 0.0
 MAX_BALANCE = 0.0
@@ -39,8 +38,6 @@ WINS = 0
 LOSSES = 0
 TRADE_COUNT = 0
 TRADE_AMOUNT = BASE_STAKE
-LAST_PROFIT = 0.0
-LAST_DIRECTION = ""
 
 trade_in_progress = False
 last_proposal_time = 0
@@ -49,7 +46,6 @@ stop_bot = False
 
 ws = None
 lock = threading.Lock()
-
 DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 console = Console()
 
@@ -103,6 +99,14 @@ def extract_features():
         arr.std()
     ])
 
+def record_trade_log(direction, stake, confidence, profit):
+    trade_log.appendleft({
+        "Direction": direction,
+        "Stake": f"{stake:.2f}",
+        "Confidence": f"{confidence:.2f}",
+        "Profit": f"{profit:.2f}"
+    })
+
 # ================= TRADING =================
 def evaluate_and_trade():
     global last_proposal_time, TRADE_AMOUNT
@@ -141,7 +145,7 @@ def process_trade_queue():
         send_proposal(direction, duration, stake)
 
 def send_proposal(direction, duration, stake):
-    global trade_in_progress, LAST_DIRECTION
+    global trade_in_progress
     ct = "CALL" if direction == "up" else "PUT"
     ws.send(json.dumps({
         "proposal": 1,
@@ -154,19 +158,21 @@ def send_proposal(direction, duration, stake):
         "symbol": SYMBOL
     }))
     trade_in_progress = True
-    LAST_DIRECTION = direction
 
 def on_contract_settlement(c):
-    global BALANCE, WINS, LOSSES, TRADE_COUNT, trade_in_progress, MAX_BALANCE, LAST_PROFIT
+    global BALANCE, WINS, LOSSES, TRADE_COUNT, trade_in_progress, MAX_BALANCE
     profit = float(c.get("profit") or 0)
-    LAST_PROFIT = profit
     BALANCE += profit
     MAX_BALANCE = max(MAX_BALANCE, BALANCE)
-    balance_history.append(BALANCE)
     WINS += profit > 0
     LOSSES += profit <= 0
     TRADE_COUNT += 1
     trade_in_progress = False
+
+    # Record last trade log
+    last_trade = trade_queue[0] if trade_queue else (last_direction, TRADE_AMOUNT, 0.7)
+    record_trade_log(last_trade[0], last_trade[2], 0.7, profit)
+
     features = extract_features()
     if features is not None:
         learner.update(features, profit)
@@ -181,6 +187,7 @@ def on_message(ws, msg):
             tick = float(data["tick"]["quote"])
             tick_history.append(tick)
             tick_buffer.append(tick)
+            console.log(f"[bold cyan]TICK {tick}[/bold cyan]")
             evaluate_and_trade()
         if "proposal" in data:
             time.sleep(PROPOSAL_DELAY)
@@ -192,8 +199,8 @@ def on_message(ws, msg):
         if "balance" in data:
             global BALANCE
             BALANCE = float(data["balance"]["balance"])
-    except Exception:
-        pass
+    except Exception as e:
+        console.log(f"[red]Error in on_message:[/red] {e}")
 
 def resubscribe():
     ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
@@ -210,46 +217,38 @@ def start_ws():
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
 # ================= DASHBOARD =================
-def render_sparkline(data, width=30):
-    if not data:
-        return "-"
-    arr = np.array(data)
-    min_val, max_val = arr.min(), arr.max()
-    if min_val == max_val:
-        return "─" * width
-    scaled = ((arr - min_val) / (max_val - min_val) * (width - 1)).astype(int)
-    line = [" "] * width
-    for s in scaled:
-        line[s] = "▇"
-    return "".join(line)
-
 def dashboard_loop():
-    """Rich console dashboard with sparkline and P/L highlights"""
-    with Live(refresh_per_second=1) as live:
+    with Live(auto_refresh=True, refresh_per_second=1) as live:
         while True:
-            table = Table(title="🚀 Momento Bot Dashboard", expand=True)
-            table.add_column("Metric", style="cyan", no_wrap=True)
-            table.add_column("Value", style="magenta", no_wrap=False)
+            table = Table(title="🚀 Momento Bot Dashboard")
+            table.add_column("Metric", justify="left")
+            table.add_column("Value", justify="right")
 
-            # Balance with trend arrow
-            bal_str = f"${BALANCE:.2f}"
-            if LAST_PROFIT > 0:
-                bal_str = f"[green]{bal_str} ↑[/green]"
-            elif LAST_PROFIT < 0:
-                bal_str = f"[red]{bal_str} ↓[/red]"
-
-            table.add_row("Balance", bal_str)
+            # Main stats
+            table.add_row("Balance", f"{BALANCE:.2f}")
+            table.add_row("Max Balance", f"{MAX_BALANCE:.2f}")
             table.add_row("Trades", str(TRADE_COUNT))
-            table.add_row("Wins", f"[green]{WINS}[/green]")
-            table.add_row("Losses", f"[red]{LOSSES}[/red]")
-            table.add_row("Last Trade", LAST_DIRECTION.capitalize() if LAST_DIRECTION else "-")
-            table.add_row("Balance Trend", render_sparkline(balance_history))
+            table.add_row("Wins", str(WINS))
+            table.add_row("Losses", str(LOSSES))
+
+            # Last 5 trades
+            table.add_section()
+            table.add_row("[bold]Last Trades[/bold]", "")
+            trade_table = Table()
+            trade_table.add_column("Dir")
+            trade_table.add_column("Stake")
+            trade_table.add_column("Conf")
+            trade_table.add_column("Profit")
+            for t in trade_log:
+                trade_table.add_row(t["Direction"], t["Stake"], t["Confidence"], t["Profit"])
+
+            table.add_row("", trade_table)
             live.update(table)
             time.sleep(1)
 
 # ================= START =================
 if __name__ == "__main__":
-    console.print("[green]🚀 Momento Bot starting on Koyeb with rich dashboard and sparkline[/green]")
+    console.print("[green]🚀 Momento Bot starting on Koyeb[/green]")
     start_ws()
     threading.Thread(target=dashboard_loop, daemon=True).start()
     while True:
