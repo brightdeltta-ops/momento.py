@@ -3,6 +3,8 @@ from collections import deque
 from rich.console import Console
 from rich.table import Table
 from rich.live import Live
+from rich.text import Text
+from datetime import datetime
 
 # ================= CONFIG =================
 API_TOKEN = os.getenv("DERIV_API_TOKEN")
@@ -230,6 +232,7 @@ def start_ws():
 # ================= DASHBOARD =================
 def dashboard_loop():
     with Live(auto_refresh=True, refresh_per_second=1) as live:
+        last_trade_count = -1
         while True:
             table = Table(title="🚀 Momento Bot Dashboard")
             table.add_column("Metric", justify="left")
@@ -241,7 +244,15 @@ def dashboard_loop():
             table.add_row("Wins", str(WINS))
             table.add_row("Losses", str(LOSSES))
 
-            # Last trades
+            # Heartbeat
+            if TRADE_COUNT == last_trade_count:
+                local_time = datetime.now().strftime("%H:%M:%S")
+                table.add_row("❤️ HEARTBEAT", f"{local_time} | No new trades")
+            else:
+                last_trade_count = TRADE_COUNT
+                table.add_row("✅ Last Trade Update", f"Balance={BALANCE:.2f}")
+
+            # Last trades table
             table.add_section()
             table.add_row("[bold]Last Trades[/bold]", "")
             trade_table = Table()
@@ -249,10 +260,22 @@ def dashboard_loop():
             trade_table.add_column("Stake")
             trade_table.add_column("Conf")
             trade_table.add_column("Profit")
-            for t in trade_log:
-                trade_table.add_row(t["Direction"], t["Stake"], t["Confidence"], t["Profit"])
-            table.add_row("", trade_table)
 
+            for t in trade_log:
+                profit = float(t["Profit"])
+                profit_text = Text(f"{profit:.2f}")
+                if profit > 0:
+                    profit_text.stylize("green")
+                elif profit < 0:
+                    profit_text.stylize("red")
+                trade_table.add_row(
+                    t["Direction"],
+                    t["Stake"],
+                    t["Confidence"],
+                    profit_text
+                )
+
+            table.add_row("", trade_table)
             live.update(table)
             time.sleep(1)
 
