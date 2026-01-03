@@ -65,6 +65,28 @@ class OnlineLearner:
 
 learner = OnlineLearner(n_features=4)
 
+# ================= LOGGING HELPERS =================
+def log_tick(tick):
+    ts = datetime.now().strftime("%H:%M:%S")
+    console.log(f"[bold cyan][{ts}] TICK {tick:.4f}[/bold cyan]")
+
+def log_trade(direction, stake, profit):
+    ts = datetime.now().strftime("%H:%M:%S")
+    if profit > 0:
+        console.log(f"[green][{ts}] ✅ Trade {direction} | Stake=${stake:.2f} | Profit=${profit:.2f}[/green]")
+    elif profit < 0:
+        console.log(f"[red][{ts}] ❌ Trade {direction} | Stake=${stake:.2f} | Loss=${profit:.2f}[/red]")
+    else:
+        console.log(f"[yellow][{ts}] ⚪ Trade {direction} | Stake=${stake:.2f} | Break-even[/yellow]")
+
+def log_proposal(direction, stake):
+    ts = datetime.now().strftime("%H:%M:%S")
+    console.log(f"[magenta][{ts}] 📤 Proposal sent {direction.upper()} | Stake=${stake:.2f}[/magenta]")
+
+def log_heartbeat():
+    ts = datetime.now().strftime("%H:%M:%S")
+    console.log(f"[blue][{ts}] ❤️ HEARTBEAT: Bot running, no new trades[/blue]")
+
 # ================= UTILITIES =================
 def calculate_ema(data, period):
     if len(data) < period:
@@ -149,7 +171,7 @@ def send_proposal(direction, duration, stake):
         "duration_unit": "t",
         "symbol": SYMBOL
     }))
-    console.log(f"[magenta]📤 Proposal sent {ct} ${stake:.2f}[/magenta]")
+    log_proposal(ct, stake)
     trade_in_progress = True
 
 def on_contract_settlement(c):
@@ -162,12 +184,11 @@ def on_contract_settlement(c):
     TRADE_COUNT += 1
     trade_in_progress = False
     record_trade_log(last_direction or "N/A", TRADE_AMOUNT, 0.7, profit)
+    log_trade(last_direction or "N/A", TRADE_AMOUNT, profit)
 
     features = extract_features()
     if features is not None:
         learner.update(features, profit)
-
-    console.log(f"[cyan]📊 Trade closed | PnL={profit:.2f} | Bal={BALANCE:.2f}[/cyan]")
 
 # ================= WEBSOCKET =================
 def resubscribe():
@@ -198,7 +219,7 @@ def start_ws():
                 tick = float(data["tick"]["quote"])
                 tick_history.append(tick)
                 tick_buffer.append(tick)
-                console.log(f"[cyan]TICK {tick}[/cyan]")
+                log_tick(tick)
                 evaluate_and_trade()
             if "proposal" in data:
                 time.sleep(PROPOSAL_DELAY)
@@ -246,8 +267,9 @@ def dashboard_loop():
 
             # Heartbeat
             if TRADE_COUNT == last_trade_count:
-                local_time = datetime.now().strftime("%H:%M:%S")
-                table.add_row("❤️ HEARTBEAT", f"{local_time} | No new trades")
+                last_trade_count = TRADE_COUNT
+                log_heartbeat()
+                table.add_row("❤️ HEARTBEAT", datetime.now().strftime("%H:%M:%S") + " | No new trades")
             else:
                 last_trade_count = TRADE_COUNT
                 table.add_row("✅ Last Trade Update", f"Balance={BALANCE:.2f}")
