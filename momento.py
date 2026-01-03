@@ -1,16 +1,13 @@
-import json
-import threading
-import time
-import websocket
-import numpy as np
+import json, threading, time, websocket, numpy as np, os
 from collections import deque
-import os
 from rich.console import Console
 from rich.table import Table
 from rich.live import Live
+from rich.progress import BarColumn, Progress, TextColumn
+from rich.text import Text
 
 # ================= CONFIG =================
-API_TOKEN = os.getenv("DERIV_API_TOKEN") or os.getenv("API_TOKEN")
+API_TOKEN = os.getenv("API_TOKEN")
 APP_ID = int(os.getenv("APP_ID", "0"))
 
 if not API_TOKEN or not APP_ID:
@@ -34,6 +31,7 @@ MAX_DD = 0.2
 tick_history = deque(maxlen=500)
 tick_buffer = deque(maxlen=MICRO_SLICE)
 trade_queue = deque(maxlen=30)
+balance_history = deque(maxlen=50)  # for sparkline
 
 BALANCE = 0.0
 MAX_BALANCE = 0.0
@@ -41,66 +39,74 @@ WINS = 0
 LOSSES = 0
 TRADE_COUNT = 0
 TRADE_AMOUNT = BASE_STAKE
+LAST_PROFIT = 0.0
+LAST_DIRECTION = ""
 
 trade_in_progress = False
 last_proposal_time = 0
 last_direction = None
+stop_bot = False
 
 ws = None
-console = Console()
+lock = threading.Lock()
 
 DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+console = Console()
 
 # ================= ONLINE LEARNER =================
 class OnlineLearner:
-    def __init__(self, n):
-        self.w = np.zeros(n)
-        self.b = 0.0
+    def __init__(self, n_features):
+        self.weights = np.zeros(n_features)
+        self.bias = 0.0
         self.lr = 0.1
 
     def predict(self, x):
-        return 1 if np.dot(self.w, x) + self.b > 0 else -1
+        return 1 if np.dot(self.weights, x) + self.bias > 0 else -1
 
     def update(self, x, profit):
         y = 1 if profit > 0 else -1
-        err = y - self.predict(x)
-        self.w += self.lr * err * x
-        self.b += self.lr * err
+        error = y - self.predict(x)
+        self.weights += self.lr * error * x
+        self.bias += self.lr * error
 
-learner = OnlineLearner(4)
+learner = OnlineLearner(n_features=4)
 
 # ================= UTILITIES =================
-def ema(data, period):
+def calculate_ema(data, period):
     if len(data) < period:
         return None
-    w = np.exp(np.linspace(-1, 0, period))
-    w /= w.sum()
-    return np.convolve(data[-period:], w, mode="valid")[0]
+    weights = np.exp(np.linspace(-1., 0., period))
+    weights /= weights.sum()
+    return np.convolve(data[-period:], weights, mode="valid")[0]
 
 def session_loss_check():
-    if MAX_BALANCE == 0:
-        return True
     return (MAX_BALANCE - BALANCE) < (MAX_BALANCE * MAX_DD)
 
-def dynamic_stake(conf):
-    return min(BASE_STAKE + conf * BALANCE * TRADE_RISK_FRAC, MAX_STAKE)
+def calculate_dynamic_stake(confidence):
+    return min(BASE_STAKE + confidence * BALANCE * TRADE_RISK_FRAC, MAX_STAKE)
+
+def check_trade_memory(direction):
+    global last_direction
+    if direction == last_direction:
+        return False
+    last_direction = direction
+    return True
 
 def extract_features():
     if len(tick_buffer) < MICRO_SLICE:
         return None
     arr = np.array(tick_buffer)
     return np.array([
-        ema(arr, EMA_FAST),
-        ema(arr, EMA_SLOW),
+        calculate_ema(arr, EMA_FAST),
+        calculate_ema(arr, EMA_SLOW),
         arr[-1] - arr[0],
         arr.std()
     ])
 
-# ================= TRADING LOGIC =================
+# ================= TRADING =================
 def evaluate_and_trade():
-    global last_proposal_time, TRADE_AMOUNT, last_direction
-
-    if trade_in_progress:
+    global last_proposal_time, TRADE_AMOUNT
+    if stop_bot:
         return
     if time.time() - last_proposal_time < PROPOSAL_COOLDOWN:
         return
@@ -108,41 +114,34 @@ def evaluate_and_trade():
         return
     if len(tick_history) < VOLATILITY_WINDOW:
         return
-    if np.std(list(tick_history)[-VOLATILITY_WINDOW:]) < VOLATILITY_THRESHOLD:
+    if np.array(list(tick_history)[-VOLATILITY_WINDOW:]).std() < VOLATILITY_THRESHOLD:
         return
 
     features = extract_features()
-    if features is None or None in features:
+    if features is None:
         return
 
     direction = "up" if learner.predict(features) == 1 else "down"
     ema_trend = "up" if features[0] > features[1] else "down"
-
     if direction != ema_trend:
         return
-    if direction == last_direction:
+    if not check_trade_memory(direction):
         return
 
-    last_direction = direction
-    TRADE_AMOUNT = dynamic_stake(0.7)
-
-    console.log(
-        f"[yellow]SIGNAL[/yellow] {direction.upper()} "
-        f"Stake={TRADE_AMOUNT:.2f}"
-    )
-
+    confidence = 0.7
+    TRADE_AMOUNT = calculate_dynamic_stake(confidence)
     trade_queue.append((direction, 1, TRADE_AMOUNT))
     last_proposal_time = time.time()
-    process_queue()
+    process_trade_queue()
 
-def process_queue():
+def process_trade_queue():
+    global trade_in_progress
     if trade_queue and not trade_in_progress:
-        d, t, s = trade_queue.popleft()
-        send_proposal(d, t, s)
+        direction, duration, stake = trade_queue.popleft()
+        send_proposal(direction, duration, stake)
 
 def send_proposal(direction, duration, stake):
-    global trade_in_progress
-
+    global trade_in_progress, LAST_DIRECTION
     ct = "CALL" if direction == "up" else "PUT"
     ws.send(json.dumps({
         "proposal": 1,
@@ -154,69 +153,49 @@ def send_proposal(direction, duration, stake):
         "duration_unit": "t",
         "symbol": SYMBOL
     }))
-
     trade_in_progress = True
-    console.log(f"[blue]PROPOSAL SENT[/blue] {ct} {stake:.2f}")
+    LAST_DIRECTION = direction
 
-def settle_trade(contract):
-    global BALANCE, MAX_BALANCE, WINS, LOSSES, TRADE_COUNT, trade_in_progress
-
-    profit = float(contract.get("profit") or 0)
+def on_contract_settlement(c):
+    global BALANCE, WINS, LOSSES, TRADE_COUNT, trade_in_progress, MAX_BALANCE, LAST_PROFIT
+    profit = float(c.get("profit") or 0)
+    LAST_PROFIT = profit
     BALANCE += profit
     MAX_BALANCE = max(MAX_BALANCE, BALANCE)
-
-    if profit > 0:
-        WINS += 1
-    else:
-        LOSSES += 1
-
+    balance_history.append(BALANCE)
+    WINS += profit > 0
+    LOSSES += profit <= 0
     TRADE_COUNT += 1
     trade_in_progress = False
-
-    console.log(
-        f"[green]RESULT[/green] {'WIN' if profit > 0 else 'LOSS'} "
-        f"Profit={profit:.2f} Balance={BALANCE:.2f}"
-    )
-
-    f = extract_features()
-    if f is not None:
-        learner.update(f, profit)
+    features = extract_features()
+    if features is not None:
+        learner.update(features, profit)
 
 # ================= WEBSOCKET =================
-def on_message(_, msg):
+def on_message(ws, msg):
     try:
         data = json.loads(msg)
-
         if "authorize" in data:
-            subscribe()
-
+            resubscribe()
         if "tick" in data:
             tick = float(data["tick"]["quote"])
             tick_history.append(tick)
             tick_buffer.append(tick)
-            console.log(f"[cyan]TICK[/cyan] {tick}")
             evaluate_and_trade()
-
         if "proposal" in data:
             time.sleep(PROPOSAL_DELAY)
-            ws.send(json.dumps({
-                "buy": data["proposal"]["id"],
-                "price": TRADE_AMOUNT
-            }))
-
+            ws.send(json.dumps({"buy": data["proposal"]["id"], "price": TRADE_AMOUNT}))
         if "proposal_open_contract" in data:
             c = data["proposal_open_contract"]
             if c.get("is_sold") or c.get("is_expired"):
-                settle_trade(c)
-
+                on_contract_settlement(c)
         if "balance" in data:
             global BALANCE
             BALANCE = float(data["balance"]["balance"])
+    except Exception:
+        pass
 
-    except Exception as e:
-        console.log(f"[red]ERROR[/red] {e}")
-
-def subscribe():
+def resubscribe():
     ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
     ws.send(json.dumps({"balance": 1, "subscribe": 1}))
     ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
@@ -228,23 +207,50 @@ def start_ws():
         on_open=lambda w: w.send(json.dumps({"authorize": API_TOKEN})),
         on_message=on_message
     )
-    ws.run_forever()
+    threading.Thread(target=ws.run_forever, daemon=True).start()
 
 # ================= DASHBOARD =================
-def dashboard():
-    with Live(refresh_per_second=1):
+def render_sparkline(data, width=30):
+    if not data:
+        return "-"
+    arr = np.array(data)
+    min_val, max_val = arr.min(), arr.max()
+    if min_val == max_val:
+        return "─" * width
+    scaled = ((arr - min_val) / (max_val - min_val) * (width - 1)).astype(int)
+    line = [" "] * width
+    for s in scaled:
+        line[s] = "▇"
+    return "".join(line)
+
+def dashboard_loop():
+    """Rich console dashboard with sparkline and P/L highlights"""
+    with Live(refresh_per_second=1) as live:
         while True:
-            table = Table(title="Momento Cloud Bot")
-            table.add_column("Metric")
-            table.add_column("Value")
-            table.add_row("Balance", f"{BALANCE:.2f}")
+            table = Table(title="🚀 Momento Bot Dashboard", expand=True)
+            table.add_column("Metric", style="cyan", no_wrap=True)
+            table.add_column("Value", style="magenta", no_wrap=False)
+
+            # Balance with trend arrow
+            bal_str = f"${BALANCE:.2f}"
+            if LAST_PROFIT > 0:
+                bal_str = f"[green]{bal_str} ↑[/green]"
+            elif LAST_PROFIT < 0:
+                bal_str = f"[red]{bal_str} ↓[/red]"
+
+            table.add_row("Balance", bal_str)
             table.add_row("Trades", str(TRADE_COUNT))
-            table.add_row("Wins", str(WINS))
-            table.add_row("Losses", str(LOSSES))
-            time.sleep(2)
+            table.add_row("Wins", f"[green]{WINS}[/green]")
+            table.add_row("Losses", f"[red]{LOSSES}[/red]")
+            table.add_row("Last Trade", LAST_DIRECTION.capitalize() if LAST_DIRECTION else "-")
+            table.add_row("Balance Trend", render_sparkline(balance_history))
+            live.update(table)
+            time.sleep(1)
 
 # ================= START =================
 if __name__ == "__main__":
-    console.print("[bold green]🚀 Momento Bot LIVE on Koyeb[/bold green]")
-    threading.Thread(target=dashboard, daemon=True).start()
+    console.print("[green]🚀 Momento Bot starting on Koyeb with rich dashboard and sparkline[/green]")
     start_ws()
+    threading.Thread(target=dashboard_loop, daemon=True).start()
+    while True:
+        time.sleep(5)
