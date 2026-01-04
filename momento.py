@@ -16,7 +16,7 @@ if not API_TOKEN or not APP_ID:
 SYMBOL = "R_75"
 BASE_STAKE = 1.0
 MAX_STAKE = 200.0
-TRADE_RISK_FRAC = 0.05  # aggressive fraction
+TRADE_RISK_FRAC = 0.05
 PROPOSAL_COOLDOWN = 2
 PROPOSAL_DELAY = 6
 
@@ -115,9 +115,14 @@ def extract_features():
     if len(tick_buffer) < MICRO_SLICE:
         return None
     arr = np.array(tick_buffer)
+    ema_fast = calculate_ema(arr, EMA_FAST)
+    ema_slow = calculate_ema(arr, EMA_SLOW)
+    if ema_fast is None or ema_slow is None:
+        console.log("[yellow]⚠ Skipping trade: EMA not ready[/yellow]")
+        return None
     return np.array([
-        calculate_ema(arr, EMA_FAST),
-        calculate_ema(arr, EMA_SLOW),
+        ema_fast,
+        ema_slow,
         arr[-1] - arr[0],
         arr.std()
     ])
@@ -276,6 +281,7 @@ def dashboard_loop():
             table.add_row("Trades", str(TRADE_COUNT))
             table.add_row("Wins", str(WINS))
             table.add_row("Losses", str(LOSSES))
+            table.add_row("Consecutive Losses", str(CONSECUTIVE_LOSSES))
 
             if TRADE_COUNT == last_trade_count:
                 log_heartbeat()
