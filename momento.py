@@ -1,28 +1,8 @@
-import json
-import time
-import threading
-import websocket
-import logging
-import os
+import json, threading, time, websocket, os, numpy as np, logging
 from collections import deque
 from datetime import datetime
 
-# ================= CONFIG =================
-API_TOKEN = os.getenv("DERIV_TOKEN")  # set in Koyeb
-APP_ID = os.getenv("APP_ID", "1089")
-SYMBOL = "R_75"
-
-MODE = "AGGRESSIVE"  # SAFE | AGGRESSIVE
-
-BASE_STAKE = 1.0
-MAX_STAKE = 50.0
-
-TICK_WINDOW = 20
-COOLDOWN = 5
-
-# =========================================
-
-# ---------- LOGGING ----------
+# ================= LOGGING =================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -30,121 +10,172 @@ logging.basicConfig(
 )
 log = logging.getLogger("MOMENTO")
 
-# ---------- BOT ----------
-class MomentoBot:
-    def __init__(self):
-        self.ws = None
-        self.ticks = deque(maxlen=200)
-        self.last_trade = 0
-        self.balance = 0.0
-        self.running = True
+# ================= ENV =================
+API_TOKEN = os.getenv("DERIV_API_TOKEN")
+APP_ID = int(os.getenv("APP_ID", "0"))
 
-    # ---------- CONNECTION ----------
-    def connect(self):
-        url = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-        self.ws = websocket.WebSocketApp(
-            url,
-            on_open=self.on_open,
-            on_message=self.on_message,
-            on_error=self.on_error,
-            on_close=self.on_close
-        )
-        self.ws.run_forever()
+if not API_TOKEN or not APP_ID:
+    raise RuntimeError("Missing DERIV_API_TOKEN or APP_ID")
 
-    def on_open(self, ws):
+# ================= CONFIG =================
+SYMBOL = "R_75"
+MAX_DD = 0.25
+COOLDOWN = 3
+DURATION = 1
+
+EMA_FAST = 3
+EMA_SLOW = 10
+VOL_WINDOW = 20
+
+# ================= COMPOUNDING =================
+COMPOUNDING_TABLE = [
+    (50, 0.35, "SAFE"),
+    (100, 0.50, "SAFE"),
+    (200, 0.75, "NORMAL"),
+    (400, 1.00, "NORMAL"),
+    (800, 1.50, "AGGRESSIVE"),
+    (1500, 2.00, "AGGRESSIVE"),
+]
+
+# ================= STATE =================
+ticks = deque(maxlen=500)
+balance = 0.0
+max_balance = 0.0
+last_trade = 0
+trade_active = False
+ws = None
+
+# ================= HELPERS =================
+def ema(arr, period):
+    if len(arr) < period:
+        return None
+    w = np.exp(np.linspace(-1, 0, period))
+    w /= w.sum()
+    return np.dot(arr[-period:], w)
+
+def get_compound(balance):
+    stake, mode = COMPOUNDING_TABLE[0][1], COMPOUNDING_TABLE[0][2]
+    for lvl, s, m in COMPOUNDING_TABLE:
+        if balance >= lvl:
+            stake, mode = s, m
+    return stake, mode
+
+def regime_filter():
+    if len(ticks) < VOL_WINDOW:
+        return None
+
+    arr = np.array(list(ticks)[-VOL_WINDOW:])
+    vol = arr.std()
+
+    if vol < 0.25:
+        return None
+    elif vol < 0.6:
+        return "NORMAL"
+    else:
+        return "AGGRESSIVE"
+
+def drawdown_ok():
+    return balance >= max_balance * (1 - MAX_DD)
+
+# ================= TRADING =================
+def evaluate():
+    global last_trade, trade_active
+
+    if trade_active or time.time() - last_trade < COOLDOWN:
+        return
+    if not drawdown_ok():
+        log.warning("🛑 Drawdown limit hit")
+        return
+
+    regime = regime_filter()
+    if not regime:
+        return
+
+    arr = np.array(list(ticks))
+    ef, es = ema(arr, EMA_FAST), ema(arr, EMA_SLOW)
+    if ef is None or es is None:
+        return
+
+    direction = "CALL" if ef > es else "PUT"
+    stake, mode = get_compound(balance)
+
+    if regime == "NORMAL" and mode == "AGGRESSIVE":
+        stake *= 0.7
+
+    send_trade(direction, stake, regime)
+
+def send_trade(direction, stake, regime):
+    global trade_active, last_trade
+
+    log.info(f"📤 TRADE | {direction} | ${stake:.2f} | REGIME={regime}")
+    ws.send(json.dumps({
+        "proposal": 1,
+        "amount": stake,
+        "basis": "stake",
+        "contract_type": direction,
+        "currency": "USD",
+        "duration": DURATION,
+        "duration_unit": "t",
+        "symbol": SYMBOL
+    }))
+    trade_active = True
+    last_trade = time.time()
+
+# ================= WS =================
+def start_ws():
+    global ws
+
+    def on_open(w):
         log.info("✅ Connected to Deriv WebSocket")
-        self.send({"authorize": API_TOKEN})
+        w.send(json.dumps({"authorize": API_TOKEN}))
 
-    def on_close(self, ws, code, msg):
+    def on_message(w, msg):
+        global balance, max_balance, trade_active
+        data = json.loads(msg)
+
+        if "authorize" in data:
+            w.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
+            w.send(json.dumps({"balance": 1, "subscribe": 1}))
+            w.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
+
+        if "tick" in data:
+            price = float(data["tick"]["quote"])
+            ticks.append(price)
+            evaluate()
+
+        if "proposal" in data:
+            w.send(json.dumps({"buy": data["proposal"]["id"], "price": data["proposal"]["ask_price"]}))
+
+        if "proposal_open_contract" in data:
+            c = data["proposal_open_contract"]
+            if c.get("is_sold"):
+                profit = float(c.get("profit", 0))
+                balance += profit
+                max_balance = max(max_balance, balance)
+                trade_active = False
+                log.info(f"💰 RESULT | Profit={profit:.2f} | Balance={balance:.2f}")
+
+        if "balance" in data:
+            balance = float(data["balance"]["balance"])
+            max_balance = max(max_balance, balance)
+
+    def on_error(w, e):
+        log.error(f"WS ERROR: {e}")
+
+    def on_close(w, *_):
         log.warning("❌ WebSocket closed")
 
-    def on_error(self, ws, error):
-        log.error(f"WS ERROR: {error}")
+    ws = websocket.WebSocketApp(
+        f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}",
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
+    )
 
-    # ---------- MESSAGE HANDLER ----------
-    def on_message(self, ws, message):
-        try:
-            data = json.loads(message)
+    ws.run_forever()
 
-            if "authorize" in data:
-                log.info("🔐 Authorized")
-                self.send({"balance": 1, "subscribe": 1})
-
-            elif "balance" in data:
-                self.balance = data["balance"]["balance"]
-
-            elif "tick" in data:
-                price = float(data["tick"]["quote"])
-                self.ticks.append(price)
-                log.info(f"TICK {price}")
-                self.evaluate()
-
-            elif "proposal" in data:
-                pid = data["proposal"]["id"]
-                self.send({"buy": pid, "price": BASE_STAKE})
-
-            elif "buy" in data:
-                log.info(f"🎯 TRADE EXECUTED | ID {data['buy']['contract_id']}")
-
-        except Exception as e:
-            log.error(f"on_message error: {e}")
-
-    # ---------- SIGNAL ENGINE ----------
-    def evaluate(self):
-        if len(self.ticks) < TICK_WINDOW:
-            return
-
-        if time.time() - self.last_trade < COOLDOWN:
-            return
-
-        prices = list(self.ticks)[-TICK_WINDOW:]  # ✅ FIXED
-
-        momentum = prices[-1] - prices[0]
-
-        if MODE == "AGGRESSIVE":
-            threshold = 2.0
-        else:
-            threshold = 4.0
-
-        if momentum > threshold:
-            self.trade("CALL")
-
-        elif momentum < -threshold:
-            self.trade("PUT")
-
-        self.heartbeat()
-
-    # ---------- TRADE ----------
-    def trade(self, direction):
-        if BASE_STAKE > MAX_STAKE:
-            return
-
-        log.info(f"🚀 SIGNAL {direction} | Stake ${BASE_STAKE}")
-        self.last_trade = time.time()
-
-        self.send({
-            "proposal": 1,
-            "amount": BASE_STAKE,
-            "basis": "stake",
-            "contract_type": direction,
-            "currency": "USD",
-            "duration": 1,
-            "duration_unit": "t",
-            "symbol": SYMBOL
-        })
-
-    # ---------- HEARTBEAT ----------
-    def heartbeat(self):
-        log.info(f"❤️ HEARTBEAT | {MODE} | Balance ${self.balance:.2f}")
-
-    # ---------- SEND ----------
-    def send(self, payload):
-        if self.ws:
-            self.ws.send(json.dumps(payload))
-
-
-# ---------- RUN ----------
+# ================= START =================
 if __name__ == "__main__":
     log.info("🔥 MOMENTO BOT STARTING")
-    bot = MomentoBot()
-    bot.connect()
+    start_ws()
