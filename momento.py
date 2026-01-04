@@ -1,213 +1,112 @@
-import json, threading, time, websocket, numpy as np, os
+import os
+import websocket
+import json
+import threading
+import time
 from collections import deque
-from rich.console import Console
-from rich.text import Text
-from datetime import datetime
+import numpy as np
 
-# ================= ENV CONFIG =================
-API_TOKEN = os.getenv("DERIV_API_TOKEN")
-APP_ID = int(os.getenv("APP_ID", "0"))
+# ================= USER CONFIG =================
+DERIV_TOKEN = os.getenv("DERIV_TOKEN")  # Must be set in Koyeb secrets
+SYMBOL = "R_75"  # V75 Synthetic Index
+BASE_STAKE = 1.0
+MAX_STAKE = 50.0
+MIN_TICKS = 15
+PROFIT_TARGET = 5.0  # % per successful cycle
+TICK_BUFFER = 50  # store last N ticks
 
-if not API_TOKEN or not APP_ID:
-    raise RuntimeError("Missing DERIV_API_TOKEN or APP_ID environment variables")
+# EMA Settings for 1s tick
+FAST_EMA_PERIOD = 5
+SLOW_EMA_PERIOD = 12
 
-# ================= TRADING CONFIG =================
-SYMBOL = "R_75"
+# ================================================
 
-BASE_RISK = 0.012            # 1.2% normal risk
-BURST_RISK = 0.015           # 1.5% burst risk
-MAX_STAKE = 100.0
-MAX_DAILY_DD = 0.06          # 6% daily kill switch
-COOLDOWN = 6
-DURATION = 1                # ticks
+# Tick storage
+ticks = deque(maxlen=TICK_BUFFER)
 
-EMA_FAST = 3
-EMA_SLOW = 10
-VOL_WINDOW = 20
-VOL_THRESHOLD = 0.0015
-
-# ================= STATE =================
-tick_buffer = deque(maxlen=50)
-price_history = deque(maxlen=500)
-
-BALANCE = 0.0
-DAY_START_BAL = 0.0
-MAX_BALANCE = 0.0
-
-WINS = 0
-LOSSES = 0
-TRADE_COUNT = 0
-
-trade_in_progress = False
-last_trade_time = 0
-last_direction = None
-
-win_streak = 0
-burst_mode = False
-
-ws = None
-console = Console()
-
-# ================= INDICATORS =================
-def ema(data, p):
-    if len(data) < p:
+# EMA helper
+def calculate_ema(prices, period):
+    if len(prices) < period:
         return None
-    w = np.exp(np.linspace(-1, 0, p))
-    w /= w.sum()
-    return np.convolve(data[-p:], w, mode="valid")[0]
+    prices_array = np.array(prices[-period:])
+    weights = np.exp(np.linspace(-1., 0., period))
+    weights /= weights.sum()
+    return np.dot(prices_array, weights)
 
-# ================= RISK =================
-def daily_dd_exceeded():
-    if DAY_START_BAL == 0:
-        return False
-    dd = (DAY_START_BAL - BALANCE) / DAY_START_BAL
-    return dd >= MAX_DAILY_DD
+# Fractal breakout detection (simple)
+def detect_fractal(prices):
+    if len(prices) < 7:
+        return None
+    mid = len(prices) // 2
+    if prices[mid] > max(prices[mid-3:mid]+prices[mid+1:mid+4]):
+        return "up"
+    elif prices[mid] < min(prices[mid-3:mid]+prices[mid+1:mid+4]):
+        return "down"
+    return None
 
-def calc_stake(risk):
-    stake = BALANCE * risk
-    return min(stake, MAX_STAKE)
+# Trading logic
+def generate_signal():
+    if len(ticks) < MIN_TICKS:
+        return None
+    tick_list = list(ticks)
+    ema_fast = calculate_ema(tick_list, FAST_EMA_PERIOD)
+    ema_slow = calculate_ema(tick_list, SLOW_EMA_PERIOD)
+    fractal_signal = detect_fractal(tick_list[-7:])  # last 7 ticks for fractal
 
-# ================= LOGGING =================
-def log(msg, color="white"):
-    ts = datetime.now().strftime("%H:%M:%S")
-    console.print(f"[{color}][{ts}] {msg}[/{color}]")
+    if ema_fast is None or ema_slow is None:
+        return None
 
-# ================= STRATEGY =================
-def evaluate_trade():
-    global burst_mode, last_trade_time
+    if ema_fast > ema_slow and fractal_signal == "up":
+        return "buy"
+    elif ema_fast < ema_slow and fractal_signal == "down":
+        return "sell"
+    return None
 
-    if trade_in_progress:
-        return
-    if time.time() - last_trade_time < COOLDOWN:
-        return
-    if daily_dd_exceeded():
-        log("⛔ DAILY LOSS LIMIT HIT — BOT STOPPED", "red")
-        return
+# Trade execution simulation (replace with real API call)
+def execute_trade(signal, stake):
+    print(f"[TRADE] {signal.upper()} | Stake: ${stake}")
+    # Simulate trade success
+    win = np.random.choice([True, False], p=[0.55, 0.45])
+    return win
 
-    if len(price_history) < VOL_WINDOW:
-        return
+# Koyeb-safe WebSocket connection
+def on_message(ws, message):
+    data = json.loads(message)
+    tick = data.get("tick")
+    if tick is not None:
+        ticks.append(tick)
+        signal = generate_signal()
+        if signal:
+            stake = min(BASE_STAKE, MAX_STAKE)
+            win = execute_trade(signal, stake)
+            if win:
+                print(f"[WIN] Signal {signal} successful!")
+                # Optional: fast compounding
+                global BASE_STAKE
+                BASE_STAKE = min(BASE_STAKE * 1.2, MAX_STAKE)
+            else:
+                print(f"[LOSS] Signal {signal} failed.")
+                BASE_STAKE = 1.0  # reset to base on loss
 
-    vol = np.std(list(price_history)[-VOL_WINDOW:])
-    if vol < VOL_THRESHOLD:
-        return
+def on_error(ws, error):
+    print(f"[WS ERROR] {error}")
 
-    f = ema(price_history, EMA_FAST)
-    s = ema(price_history, EMA_SLOW)
-    if f is None or s is None:
-        return
+def on_close(ws):
+    print("[WS CLOSED] Connection closed")
 
-    direction = "up" if f > s else "down"
-    if direction == last_direction:
-        return
+def on_open(ws):
+    print("[WS OPEN] Connected to Deriv API")
 
-    risk = BURST_RISK if burst_mode else BASE_RISK
-    stake = calc_stake(risk)
-
-    send_trade(direction, stake)
-    last_trade_time = time.time()
-
-# ================= TRADE EXEC =================
-def send_trade(direction, stake):
-    global trade_in_progress, last_direction
-
-    ct = "CALL" if direction == "up" else "PUT"
-    ws.send(json.dumps({
-        "proposal": 1,
-        "amount": round(stake, 2),
-        "basis": "stake",
-        "contract_type": ct,
-        "currency": "USD",
-        "duration": DURATION,
-        "duration_unit": "t",
-        "symbol": SYMBOL
-    }))
-
-    trade_in_progress = True
-    last_direction = direction
-    log(f"📤 PROPOSAL {ct} | Stake ${stake:.2f}", "magenta")
-
-# ================= CONTRACT RESULT =================
-def settle_trade(contract):
-    global BALANCE, MAX_BALANCE, WINS, LOSSES, TRADE_COUNT
-    global trade_in_progress, win_streak, burst_mode
-
-    profit = float(contract.get("profit", 0))
-    BALANCE += profit
-    MAX_BALANCE = max(MAX_BALANCE, BALANCE)
-    TRADE_COUNT += 1
-    trade_in_progress = False
-
-    if profit > 0:
-        WINS += 1
-        win_streak += 1
-        log(f"✅ WIN +${profit:.2f} | Bal ${BALANCE:.2f}", "green")
-    else:
-        LOSSES += 1
-        win_streak = 0
-        burst_mode = False
-        log(f"❌ LOSS ${profit:.2f} | Bal ${BALANCE:.2f}", "red")
-
-    # BURST LOGIC
-    if win_streak >= 2 and not burst_mode:
-        burst_mode = True
-        log("🔥 BURST MODE ACTIVATED", "yellow")
-    if win_streak >= 3:
-        burst_mode = False
-        win_streak = 0
-        log("🔁 BURST MODE RESET", "cyan")
-
-# ================= WEBSOCKET =================
+# Connect to Deriv WebSocket
 def start_ws():
-    global ws, DAY_START_BAL
+    url = f"wss://ws.binaryws.com/websockets/v3?app_id=1089&l=EN"
+    ws = websocket.WebSocketApp(url,
+                                on_message=on_message,
+                                on_error=on_error,
+                                on_close=on_close)
+    ws.on_open = on_open
+    ws.run_forever()
 
-    url = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-    log(f"Connecting to {url}", "yellow")
-
-    def on_open(w):
-        w.send(json.dumps({"authorize": API_TOKEN}))
-
-    def on_message(w, msg):
-        data = json.loads(msg)
-
-        if "authorize" in data:
-            log("✅ AUTHORIZED", "green")
-            w.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
-            w.send(json.dumps({"balance": 1, "subscribe": 1}))
-            w.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
-
-        if "tick" in data:
-            price = float(data["tick"]["quote"])
-            price_history.append(price)
-            log(f"TICK {price:.4f}", "cyan")
-            evaluate_trade()
-
-        if "proposal" in data:
-            w.send(json.dumps({"buy": data["proposal"]["id"], "price": data["proposal"]["ask_price"]}))
-
-        if "proposal_open_contract" in data:
-            c = data["proposal_open_contract"]
-            if c.get("is_sold"):
-                settle_trade(c)
-
-        if "balance" in data:
-            global BALANCE
-            BALANCE = float(data["balance"]["balance"])
-            if DAY_START_BAL == 0:
-                DAY_START_BAL = BALANCE
-
-    ws = websocket.WebSocketApp(
-        url,
-        on_open=on_open,
-        on_message=on_message,
-        on_error=lambda w,e: log(f"WS ERROR {e}", "red"),
-        on_close=lambda w,c,m: log("WS CLOSED", "red")
-    )
-
-    threading.Thread(target=ws.run_forever, daemon=True).start()
-
-# ================= MAIN =================
+# Run bot
 if __name__ == "__main__":
-    log("🚀 MOMENTO BOT — CAC MODE STARTED", "green")
-    start_ws()
-    while True:
-        time.sleep(5)
+    threading.Thread(target=start_ws).start()
