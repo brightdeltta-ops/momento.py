@@ -6,7 +6,7 @@ from rich.live import Live
 from rich.text import Text
 from datetime import datetime
 
-# ================= CONFIG (AGGRESSIVE MODE) =================
+# ================= CONFIG =================
 API_TOKEN = os.getenv("DERIV_API_TOKEN")
 APP_ID = int(os.getenv("APP_ID", "0"))
 
@@ -14,25 +14,26 @@ if not API_TOKEN or not APP_ID:
     raise RuntimeError("Missing DERIV_API_TOKEN or APP_ID environment variables")
 
 SYMBOL = "R_75"
-BASE_STAKE = 1.0
-MAX_STAKE = 200.0
-TRADE_RISK_FRAC = 0.05  # 5% of balance
-PROPOSAL_COOLDOWN = 2   # seconds
-PROPOSAL_DELAY = 6      # seconds
 
+# ================= STRATEGY PARAMETERS =================
+BASE_STAKE = 1.0
+MAX_STAKE = 500.0
+TRADE_RISK_FRAC = 0.05  # fraction of balance per trade
+PROPOSAL_COOLDOWN = 2
+PROPOSAL_DELAY = 5
 EMA_FAST = 3
 EMA_SLOW = 10
-MICRO_SLICE = 10
-
+HTF_EMA_PERIOD = 20
+MICRO_SLICE = 12
 VOLATILITY_WINDOW = 15
 VOLATILITY_THRESHOLD = 0.0005
-MAX_DD = 0.25  # max drawdown tolerance
+MAX_DD = 0.25
 
 # ================= STATE =================
 tick_history = deque(maxlen=500)
 tick_buffer = deque(maxlen=MICRO_SLICE)
 trade_queue = deque(maxlen=50)
-trade_log = deque(maxlen=10)
+trade_log = deque(maxlen=20)
 
 BALANCE = 0.0
 MAX_BALANCE = 0.0
@@ -49,12 +50,12 @@ ws = None
 lock = threading.Lock()
 console = Console()
 
-# ================= ONLINE LEARNER =================
+# ================= ADVANCED LEARNER =================
 class OnlineLearner:
     def __init__(self, n_features):
         self.weights = np.zeros(n_features)
         self.bias = 0.0
-        self.lr = 0.1
+        self.lr = 0.15  # slightly higher for faster learning
 
     def predict(self, x):
         return 1 if np.dot(self.weights, x) + self.bias > 0 else -1
@@ -65,25 +66,25 @@ class OnlineLearner:
         self.weights += self.lr * error * x
         self.bias += self.lr * error
 
-learner = OnlineLearner(n_features=4)
+learner = OnlineLearner(n_features=5)  # EMA_fast, EMA_slow, HTF_EMA, slope, std
 
-# ================= LOGGING HELPERS =================
+# ================= LOGGING =================
 def log_tick(tick):
     ts = datetime.now().strftime("%H:%M:%S")
-    console.log(f"[bold cyan][{ts}] TICK {tick:.4f}[/bold cyan]")
+    console.log(f"[cyan][{ts}] TICK {tick:.4f}[/cyan]")
 
 def log_trade(direction, stake, profit):
     ts = datetime.now().strftime("%H:%M:%S")
     if profit > 0:
-        console.log(f"[green][{ts}] ✅ Trade {direction.upper()} | Stake=${stake:.2f} | Profit=${profit:.2f}[/green]")
+        console.log(f"[green][{ts}] ✅ Trade {direction} | Stake=${stake:.2f} | Profit=${profit:.2f}[/green]")
     elif profit < 0:
-        console.log(f"[red][{ts}] ❌ Trade {direction.upper()} | Stake=${stake:.2f} | Loss=${profit:.2f}[/red]")
+        console.log(f"[red][{ts}] ❌ Trade {direction} | Stake=${stake:.2f} | Loss=${profit:.2f}[/red]")
     else:
-        console.log(f"[yellow][{ts}] ⚪ Trade {direction.upper()} | Stake=${stake:.2f} | Break-even[/yellow]")
+        console.log(f"[yellow][{ts}] ⚪ Trade {direction} | Stake=${stake:.2f} | Break-even[/yellow]")
 
 def log_proposal(direction, stake):
     ts = datetime.now().strftime("%H:%M:%S")
-    console.log(f"[magenta][{ts}] 📤 Proposal SENT {direction.upper()} | Stake=${stake:.2f}[/magenta]")
+    console.log(f"[magenta][{ts}] 📤 Proposal sent {direction.upper()} | Stake=${stake:.2f}[/magenta]")
 
 def log_heartbeat():
     ts = datetime.now().strftime("%H:%M:%S")
@@ -97,23 +98,28 @@ def calculate_ema(data, period):
     weights /= weights.sum()
     return np.convolve(data[-period:], weights, mode="valid")[0]
 
+def calculate_slope(data):
+    if len(data) < 2:
+        return 0
+    return data[-1] - data[-2]
+
 def session_loss_check():
     return (MAX_BALANCE - BALANCE) < (MAX_BALANCE * MAX_DD)
 
 def calculate_dynamic_stake(confidence):
-    stake = min(BASE_STAKE + confidence * BALANCE * TRADE_RISK_FRAC, MAX_STAKE)
-    return max(stake, BASE_STAKE)
+    # Adaptive CAC compounding: stake increases with balance + confidence
+    return min(BASE_STAKE + confidence * BALANCE * TRADE_RISK_FRAC, MAX_STAKE)
 
 def extract_features():
     if len(tick_buffer) < MICRO_SLICE:
         return None
     arr = np.array(tick_buffer)
-    return np.array([
-        calculate_ema(arr, EMA_FAST),
-        calculate_ema(arr, EMA_SLOW),
-        arr[-1] - arr[0],
-        arr.std()
-    ])
+    micro_ema_fast = calculate_ema(arr, EMA_FAST)
+    micro_ema_slow = calculate_ema(arr, EMA_SLOW)
+    micro_slope = arr[-1] - arr[0]
+    micro_std = arr.std()
+    htf_ema = calculate_ema(tick_history, HTF_EMA_PERIOD)
+    return np.array([micro_ema_fast, micro_ema_slow, htf_ema, micro_slope, micro_std])
 
 def record_trade_log(direction, stake, confidence, profit):
     trade_log.appendleft({
@@ -137,6 +143,7 @@ def evaluate_and_trade():
     if features is None:
         return
 
+    # Multi-timeframe & learner prediction
     direction = "up" if learner.predict(features) == 1 else "down"
     confidence = 0.7
     TRADE_AMOUNT = calculate_dynamic_stake(confidence)
@@ -249,12 +256,12 @@ def dashboard_loop():
     with Live(auto_refresh=True, refresh_per_second=1) as live:
         last_trade_count = -1
         while True:
-            table = Table(title="🚀 Momento Bot Dashboard [AGGRESSIVE MODE]")
+            table = Table(title="🚀 Momento Bot Dashboard [AGGRESSIVE CAC MODE]")
             table.add_column("Metric", justify="left")
             table.add_column("Value", justify="right")
 
-            table.add_row("Balance", f"${BALANCE:.2f}")
-            table.add_row("Max Balance", f"${MAX_BALANCE:.2f}")
+            table.add_row("Balance", f"{BALANCE:.2f}")
+            table.add_row("Max Balance", f"{MAX_BALANCE:.2f}")
             table.add_row("Trades", str(TRADE_COUNT))
             table.add_row("Wins", str(WINS))
             table.add_row("Losses", str(LOSSES))
@@ -264,9 +271,8 @@ def dashboard_loop():
                 table.add_row("❤️ HEARTBEAT", datetime.now().strftime("%H:%M:%S") + " | No new trades")
             else:
                 last_trade_count = TRADE_COUNT
-                table.add_row("✅ Last Trade Update", f"Balance=${BALANCE:.2f}")
+                table.add_row("✅ Last Trade Update", f"Balance={BALANCE:.2f}")
 
-            # Last trades table
             table.add_section()
             table.add_row("[bold]Last Trades[/bold]", "")
             trade_table = Table()
@@ -277,7 +283,7 @@ def dashboard_loop():
 
             for t in trade_log:
                 profit = float(t["Profit"])
-                profit_text = Text(f"${profit:.2f}")
+                profit_text = Text(f"{profit:.2f}")
                 if profit > 0:
                     profit_text.stylize("green")
                 elif profit < 0:
@@ -295,7 +301,7 @@ def dashboard_loop():
 
 # ================= START =================
 if __name__ == "__main__":
-    console.print("[green]🚀 Momento Bot starting on Koyeb [AGGRESSIVE MODE][/green]")
+    console.print("[green]🚀 Momento Bot starting on Koyeb [AGGRESSIVE CAC MODE][/green]")
     start_ws()
     threading.Thread(target=dashboard_loop, daemon=True).start()
     while True:
