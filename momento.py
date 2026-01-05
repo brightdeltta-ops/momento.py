@@ -1,4 +1,4 @@
-import json, threading, time, websocket, numpy as np, os
+import json, threading, time, websocket, numpy as np, os, pickle
 from collections import deque
 from rich.console import Console
 from rich.table import Table
@@ -6,7 +6,7 @@ from rich.live import Live
 from rich.text import Text
 from datetime import datetime
 
-# ================= CONFIG (AGGRESSIVE MODE) =================
+# ================= CONFIG =================
 API_TOKEN = os.getenv("DERIV_API_TOKEN")
 APP_ID = int(os.getenv("APP_ID", "0"))
 
@@ -16,18 +16,21 @@ if not API_TOKEN or not APP_ID:
 SYMBOL = "R_75"
 BASE_STAKE = 1.0
 MAX_STAKE = 200.0
-TRADE_RISK_FRAC = 0.05  # Higher risk fraction
+TRADE_RISK_FRAC = 0.05  # Risk fraction
 
-PROPOSAL_COOLDOWN = 2   # Shorter cooldown
-PROPOSAL_DELAY = 6      # Faster execution
+PROPOSAL_COOLDOWN = 2
+PROPOSAL_DELAY = 6
 
 EMA_FAST = 3
 EMA_SLOW = 10
 MICRO_SLICE = 10
 
 VOLATILITY_WINDOW = 15
-VOLATILITY_THRESHOLD = 0.0005  # Lower threshold to catch more moves
-MAX_DD = 0.25  # Slightly higher drawdown tolerance
+VOLATILITY_THRESHOLD = 0.0005
+MAX_DD = 0.25
+LOSS_STREAK_LIMIT = 3  # Pause if losses exceed this
+
+STATE_FILE = "learner_state.pkl"
 
 # ================= STATE =================
 tick_history = deque(maxlen=500)
@@ -45,6 +48,7 @@ trade_in_progress = False
 last_proposal_time = 0
 last_direction = None
 stop_bot = False
+loss_streak = 0
 
 ws = None
 lock = threading.Lock()
@@ -52,21 +56,40 @@ console = Console()
 
 # ================= ONLINE LEARNER =================
 class OnlineLearner:
-    def __init__(self, n_features):
+    def __init__(self, n_features, lr=0.1):
         self.weights = np.zeros(n_features)
         self.bias = 0.0
-        self.lr = 0.1
+        self.lr = lr
+        self.recent_trades = deque(maxlen=50)
 
-    def predict(self, x):
-        return 1 if np.dot(self.weights, x) + self.bias > 0 else -1
+    def predict_confidence(self, x):
+        # returns -1..1 and confidence 0..1
+        raw = np.dot(self.weights, x) + self.bias
+        prob = 1 / (1 + np.exp(-raw))  # sigmoid for confidence
+        direction = 1 if raw > 0 else -1
+        confidence = abs(prob - 0.5) * 2  # 0..1
+        return direction, confidence
 
     def update(self, x, profit):
         y = 1 if profit > 0 else -1
-        error = y - self.predict(x)
-        self.weights += self.lr * error * x
-        self.bias += self.lr * error
+        error = y - (1 if np.dot(self.weights, x) + self.bias > 0 else -1)
+        # Momentum-weighted learning: recent trades influence update
+        weight = min(len(self.recent_trades)/10 + 1, 2)
+        self.weights += self.lr * error * x * weight
+        self.bias += self.lr * error * weight
+        self.recent_trades.append(y)
+
+    def save_state(self):
+        with open(STATE_FILE, "wb") as f:
+            pickle.dump((self.weights, self.bias), f)
+
+    def load_state(self):
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "rb") as f:
+                self.weights, self.bias = pickle.load(f)
 
 learner = OnlineLearner(n_features=4)
+learner.load_state()
 
 # ================= LOGGING HELPERS =================
 def log_tick(tick):
@@ -102,17 +125,25 @@ def session_loss_check():
     return (MAX_BALANCE - BALANCE) < (MAX_BALANCE * MAX_DD)
 
 def calculate_dynamic_stake(confidence):
-    return min(BASE_STAKE + confidence * BALANCE * TRADE_RISK_FRAC, MAX_STAKE)
+    # Scale stake by confidence and risk fraction
+    stake = BASE_STAKE + confidence * BALANCE * TRADE_RISK_FRAC
+    stake = min(stake, MAX_STAKE)
+    # Reduce stake if on loss streak
+    global loss_streak
+    if loss_streak >= LOSS_STREAK_LIMIT:
+        stake *= 0.5
+    return stake
 
 def extract_features():
     if len(tick_buffer) < MICRO_SLICE:
         return None
     arr = np.array(tick_buffer)
+    arr_smooth = arr * 0.5 + np.mean(arr) * 0.5  # simple smoothing
     return np.array([
-        calculate_ema(arr, EMA_FAST),
-        calculate_ema(arr, EMA_SLOW),
-        arr[-1] - arr[0],
-        arr.std()
+        calculate_ema(arr_smooth, EMA_FAST),
+        calculate_ema(arr_smooth, EMA_SLOW),
+        arr_smooth[-1] - arr_smooth[0],
+        arr_smooth.std()
     ])
 
 def record_trade_log(direction, stake, confidence, profit):
@@ -125,24 +156,30 @@ def record_trade_log(direction, stake, confidence, profit):
 
 # ================= TRADING =================
 def evaluate_and_trade():
-    global last_proposal_time, TRADE_AMOUNT, last_direction
+    global last_proposal_time, TRADE_AMOUNT, last_direction, loss_streak
+
     if stop_bot or time.time() - last_proposal_time < PROPOSAL_COOLDOWN:
         return
     if not session_loss_check() or len(tick_history) < VOLATILITY_WINDOW:
         return
-    # Aggressive mode: lower volatility threshold
-    if np.array(list(tick_history)[-VOLATILITY_WINDOW:]).std() < VOLATILITY_THRESHOLD:
+
+    # Adaptive volatility filter
+    recent_vol = np.array(list(tick_history)[-VOLATILITY_WINDOW:]).std()
+    vol_threshold = VOLATILITY_THRESHOLD * (1 + (MAX_BALANCE - BALANCE)/MAX_BALANCE)
+    if recent_vol < vol_threshold:
         return
 
     features = extract_features()
     if features is None:
         return
 
-    direction = "up" if learner.predict(features) == 1 else "down"
-    confidence = 0.7
-    TRADE_AMOUNT = calculate_dynamic_stake(confidence)
+    direction, confidence = learner.predict_confidence(features)
 
-    # Aggressive mode: skip EMA mismatch & repeat direction checks
+    # Skip trades if confidence too low
+    if confidence < 0.3:
+        return
+
+    TRADE_AMOUNT = calculate_dynamic_stake(confidence)
     trade_queue.append((direction, 1, TRADE_AMOUNT))
     last_proposal_time = time.time()
     last_direction = direction
@@ -171,7 +208,7 @@ def send_proposal(direction, duration, stake):
     trade_in_progress = True
 
 def on_contract_settlement(c):
-    global BALANCE, WINS, LOSSES, TRADE_COUNT, trade_in_progress, MAX_BALANCE
+    global BALANCE, WINS, LOSSES, TRADE_COUNT, trade_in_progress, MAX_BALANCE, loss_streak
     profit = float(c.get("profit") or 0)
     BALANCE += profit
     MAX_BALANCE = max(MAX_BALANCE, BALANCE)
@@ -182,9 +219,17 @@ def on_contract_settlement(c):
     record_trade_log(last_direction or "N/A", TRADE_AMOUNT, 0.7, profit)
     log_trade(last_direction or "N/A", TRADE_AMOUNT, profit)
 
+    # Update learner
     features = extract_features()
     if features is not None:
         learner.update(features, profit)
+        learner.save_state()
+
+    # Update loss streak
+    if profit <= 0:
+        loss_streak += 1
+    else:
+        loss_streak = 0
 
 # ================= WEBSOCKET =================
 def resubscribe():
@@ -251,7 +296,7 @@ def dashboard_loop():
     with Live(auto_refresh=True, refresh_per_second=1) as live:
         last_trade_count = -1
         while True:
-            table = Table(title="🚀 Momento Bot Dashboard [AGGRESSIVE MODE]")
+            table = Table(title="🚀 Momento Bot Dashboard [INTELLIGENT MODE]")
             table.add_column("Metric", justify="left")
             table.add_column("Value", justify="right")
 
@@ -260,8 +305,8 @@ def dashboard_loop():
             table.add_row("Trades", str(TRADE_COUNT))
             table.add_row("Wins", str(WINS))
             table.add_row("Losses", str(LOSSES))
+            table.add_row("Loss Streak", str(loss_streak))
 
-            # Heartbeat
             if TRADE_COUNT == last_trade_count:
                 log_heartbeat()
                 table.add_row("❤️ HEARTBEAT", datetime.now().strftime("%H:%M:%S") + " | No new trades")
@@ -269,7 +314,6 @@ def dashboard_loop():
                 last_trade_count = TRADE_COUNT
                 table.add_row("✅ Last Trade Update", f"Balance={BALANCE:.2f}")
 
-            # Last trades table
             table.add_section()
             table.add_row("[bold]Last Trades[/bold]", "")
             trade_table = Table()
@@ -298,7 +342,7 @@ def dashboard_loop():
 
 # ================= START =================
 if __name__ == "__main__":
-    console.print("[green]🚀 Momento Bot starting on Koyeb [AGGRESSIVE MODE][/green]")
+    console.print("[green]🚀 Momento Bot starting on Koyeb [INTELLIGENT MODE][/green]")
     start_ws()
     threading.Thread(target=dashboard_loop, daemon=True).start()
     while True:
