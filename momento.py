@@ -73,7 +73,6 @@ class OnlineLearner:
     def update(self, x, profit):
         y = 1 if profit > 0 else -1
         error = y - (1 if np.dot(self.weights, x) + self.bias > 0 else -1)
-        # Momentum-weighted learning: recent trades influence update
         weight = min(len(self.recent_trades)/10 + 1, 2)
         self.weights += self.lr * error * x * weight
         self.bias += self.lr * error * weight
@@ -115,20 +114,21 @@ def log_heartbeat():
 
 # ================= UTILITIES =================
 def calculate_ema(data, period):
-    if len(data) < period:
-        return None
+    if len(data) < period or period == 0:
+        return 0.0
     weights = np.exp(np.linspace(-1., 0., period))
-    weights /= weights.sum()
+    wsum = weights.sum()
+    if wsum == 0:
+        return 0.0
+    weights /= wsum
     return np.convolve(data[-period:], weights, mode="valid")[0]
 
 def session_loss_check():
     return (MAX_BALANCE - BALANCE) < (MAX_BALANCE * MAX_DD)
 
 def calculate_dynamic_stake(confidence):
-    # Scale stake by confidence and risk fraction
     stake = BASE_STAKE + confidence * BALANCE * TRADE_RISK_FRAC
     stake = min(stake, MAX_STAKE)
-    # Reduce stake if on loss streak
     global loss_streak
     if loss_streak >= LOSS_STREAK_LIMIT:
         stake *= 0.5
@@ -138,12 +138,13 @@ def extract_features():
     if len(tick_buffer) < MICRO_SLICE:
         return None
     arr = np.array(tick_buffer)
-    arr_smooth = arr * 0.5 + np.mean(arr) * 0.5  # simple smoothing
+    arr_smooth = arr * 0.5 + np.mean(arr) * 0.5
+    arr_std = arr_smooth.std() or 1e-8  # prevent division by zero
     return np.array([
         calculate_ema(arr_smooth, EMA_FAST),
         calculate_ema(arr_smooth, EMA_SLOW),
         arr_smooth[-1] - arr_smooth[0],
-        arr_smooth.std()
+        arr_std
     ])
 
 def record_trade_log(direction, stake, confidence, profit):
@@ -163,9 +164,8 @@ def evaluate_and_trade():
     if not session_loss_check() or len(tick_history) < VOLATILITY_WINDOW:
         return
 
-    # Adaptive volatility filter
     recent_vol = np.array(list(tick_history)[-VOLATILITY_WINDOW:]).std()
-    vol_threshold = VOLATILITY_THRESHOLD * (1 + (MAX_BALANCE - BALANCE)/MAX_BALANCE)
+    vol_threshold = VOLATILITY_THRESHOLD * (1 + (MAX_BALANCE - BALANCE)/MAX_BALANCE if MAX_BALANCE != 0 else 1)
     if recent_vol < vol_threshold:
         return
 
@@ -175,7 +175,6 @@ def evaluate_and_trade():
 
     direction, confidence = learner.predict_confidence(features)
 
-    # Skip trades if confidence too low
     if confidence < 0.3:
         return
 
@@ -219,17 +218,12 @@ def on_contract_settlement(c):
     record_trade_log(last_direction or "N/A", TRADE_AMOUNT, 0.7, profit)
     log_trade(last_direction or "N/A", TRADE_AMOUNT, profit)
 
-    # Update learner
     features = extract_features()
     if features is not None:
         learner.update(features, profit)
         learner.save_state()
 
-    # Update loss streak
-    if profit <= 0:
-        loss_streak += 1
-    else:
-        loss_streak = 0
+    loss_streak = loss_streak + 1 if profit <= 0 else 0
 
 # ================= WEBSOCKET =================
 def resubscribe():
