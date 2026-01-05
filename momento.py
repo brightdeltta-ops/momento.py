@@ -16,7 +16,7 @@ if not API_TOKEN or not APP_ID:
 SYMBOL = "R_75"
 BASE_STAKE = 1.0
 MAX_STAKE = 200.0
-TRADE_RISK_FRAC = 0.05  # Risk fraction
+TRADE_RISK_FRAC = 0.05
 
 PROPOSAL_COOLDOWN = 2
 PROPOSAL_DELAY = 6
@@ -26,9 +26,9 @@ EMA_SLOW = 10
 MICRO_SLICE = 10
 
 VOLATILITY_WINDOW = 15
-VOLATILITY_THRESHOLD = 0.0005
+VOLATILITY_THRESHOLD = 0.0003  # lower to allow more trades at startup
 MAX_DD = 0.25
-LOSS_STREAK_LIMIT = 3  # Pause if losses exceed this
+LOSS_STREAK_LIMIT = 3
 
 STATE_FILE = "learner_state.pkl"
 
@@ -63,11 +63,10 @@ class OnlineLearner:
         self.recent_trades = deque(maxlen=50)
 
     def predict_confidence(self, x):
-        # returns -1..1 and confidence 0..1
         raw = np.dot(self.weights, x) + self.bias
-        prob = 1 / (1 + np.exp(-raw))  # sigmoid for confidence
+        prob = 1 / (1 + np.exp(-raw))
         direction = 1 if raw > 0 else -1
-        confidence = abs(prob - 0.5) * 2  # 0..1
+        confidence = abs(prob - 0.5) * 2
         return direction, confidence
 
     def update(self, x, profit):
@@ -89,28 +88,6 @@ class OnlineLearner:
 
 learner = OnlineLearner(n_features=4)
 learner.load_state()
-
-# ================= LOGGING HELPERS =================
-def log_tick(tick):
-    ts = datetime.now().strftime("%H:%M:%S")
-    console.log(f"[bold cyan][{ts}] TICK {tick:.4f}[/bold cyan]")
-
-def log_trade(direction, stake, profit):
-    ts = datetime.now().strftime("%H:%M:%S")
-    if profit > 0:
-        console.log(f"[green][{ts}] ✅ Trade {direction} | Stake=${stake:.2f} | Profit=${profit:.2f}[/green]")
-    elif profit < 0:
-        console.log(f"[red][{ts}] ❌ Trade {direction} | Stake=${stake:.2f} | Loss=${profit:.2f}[/red]")
-    else:
-        console.log(f"[yellow][{ts}] ⚪ Trade {direction} | Stake=${stake:.2f} | Break-even[/yellow]")
-
-def log_proposal(direction, stake):
-    ts = datetime.now().strftime("%H:%M:%S")
-    console.log(f"[magenta][{ts}] 📤 Proposal sent {direction.upper()} | Stake=${stake:.2f}[/magenta]")
-
-def log_heartbeat():
-    ts = datetime.now().strftime("%H:%M:%S")
-    console.log(f"[blue][{ts}] ❤️ HEARTBEAT: Bot running, no new trades[/blue]")
 
 # ================= UTILITIES =================
 def calculate_ema(data, period):
@@ -138,8 +115,8 @@ def extract_features():
     if len(tick_buffer) < MICRO_SLICE:
         return None
     arr = np.array(tick_buffer)
-    arr_smooth = arr * 0.5 + np.mean(arr) * 0.5
-    arr_std = arr_smooth.std() or 1e-8  # prevent division by zero
+    arr_smooth = arr * 0.7 + np.mean(arr) * 0.3  # faster reaction smoothing
+    arr_std = arr_smooth.std() or 1e-8
     return np.array([
         calculate_ema(arr_smooth, EMA_FAST),
         calculate_ema(arr_smooth, EMA_SLOW),
@@ -165,7 +142,7 @@ def evaluate_and_trade():
         return
 
     recent_vol = np.array(list(tick_history)[-VOLATILITY_WINDOW:]).std()
-    vol_threshold = VOLATILITY_THRESHOLD * (1 + (MAX_BALANCE - BALANCE)/MAX_BALANCE if MAX_BALANCE != 0 else 1)
+    vol_threshold = VOLATILITY_THRESHOLD
     if recent_vol < vol_threshold:
         return
 
@@ -175,7 +152,12 @@ def evaluate_and_trade():
 
     direction, confidence = learner.predict_confidence(features)
 
-    if confidence < 0.3:
+    # ===== STARTUP EXPLORATION MODE =====
+    if TRADE_COUNT < 10:
+        confidence = 0.7  # force trades to gather learning data
+
+    # allow lower confidence to start trading
+    if confidence < 0.1:
         return
 
     TRADE_AMOUNT = calculate_dynamic_stake(confidence)
@@ -336,7 +318,7 @@ def dashboard_loop():
 
 # ================= START =================
 if __name__ == "__main__":
-    console.print("[green]🚀 Momento Bot starting on Koyeb [INTELLIGENT MODE][/green]")
+    console.print("[green]🚀 Momento Bot starting on Koyeb [INTELLIGENT MODE - EXPLORATION][/green]")
     start_ws()
     threading.Thread(target=dashboard_loop, daemon=True).start()
     while True:
