@@ -1,261 +1,279 @@
-import json
-import time
-import threading
-import websocket
-import numpy as np
+import json, threading, time, websocket, os, pandas as pd, numpy as np
 from collections import deque
 from rich.console import Console
+from rich.table import Table
+from rich.live import Live
+from rich.text import Text
+from datetime import datetime
 
-# ================== USER CONFIG ==================
-API_TOKEN = "PUT_YOUR_DERIV_TOKEN_HERE"
-APP_ID = 112380               # MUST be valid
+# ================= CONFIG =================
+API_TOKEN = os.getenv("DERIV_API_TOKEN")
+APP_ID = int(os.getenv("APP_ID", "0"))
+
+if not API_TOKEN or not APP_ID:
+    raise RuntimeError("Missing DERIV_API_TOKEN or APP_ID environment variables")
+
 SYMBOL = "R_75"
+BASE_STAKE = 1.0
+MAX_STAKE = 200.0
+TRADE_RISK_FRAC = 0.05
+MAX_CONSECUTIVE_LOSSES = 3
 
-BASE_STAKE = 0.35
-MAX_STAKE = 2.0
+PROPOSAL_COOLDOWN = 2
+PROPOSAL_DELAY = 6
 
-FAST_EMA = 10
-SLOW_EMA = 30
-BUFFER_SIZE = 60
+EMA_FAST = 3
+EMA_SLOW = 10
+MICRO_SLICE = 10
 
-TRADE_COOLDOWN = 8            # seconds
-CONF_THRESHOLD = 0.60
-RECOVERY_CONF = 0.75
+VOLATILITY_WINDOW = 15
+VOLATILITY_THRESHOLD = 0.0005
+MAX_DD = 0.25
 
-MAX_RECOVERY_STEPS = 3
-MAX_RECOVERY_MULT = 2.5
+# ================= STATE =================
+tick_history = deque(maxlen=500)
+tick_buffer = deque(maxlen=MICRO_SLICE)
+trade_queue = deque(maxlen=50)
+trade_log = deque(maxlen=20)
 
-RECONNECT_DELAY = 5
-MAX_RECONNECT_DELAY = 60
-TICK_TIMEOUT = 20
-HEARTBEAT_INTERVAL = 5
-# =================================================
-
-console = Console()
-
-# ================== STATE ==================
-tick_buffer = deque(maxlen=BUFFER_SIZE)
+BALANCE = 0.0
+MAX_BALANCE = 0.0
+WINS = 0
+LOSSES = 0
+TRADE_COUNT = 0
+TRADE_AMOUNT = BASE_STAKE
+trade_in_progress = False
+consecutive_losses = 0
+last_proposal_time = 0
+last_direction = None
+stop_bot = False
 
 ws = None
-connected = False
-last_tick_time = 0
-last_trade_time = 0
+lock = threading.Lock()
+console = Console()
 
-trade_in_progress = False
-loss_bank = 0.0
-recovery_step = 0
-armed = False
+# ================= ONLINE LEARNER =================
+class OnlineLearner:
+    def __init__(self, n_features):
+        self.weights = np.zeros(n_features)
+        self.bias = 0.0
+        self.lr = 0.1
 
-reconnect_delay = RECONNECT_DELAY
-# ===========================================
+    def predict(self, x):
+        x = np.array(x) / (np.std(x) + 1e-6)  # normalize
+        return 1 if np.dot(self.weights, x) + self.bias > 0 else -1
 
-# ================== EMA ==================
+    def update(self, x, profit):
+        x = np.array(x) / (np.std(x) + 1e-6)
+        y = 1 if profit > 0 else -1
+        error = y - self.predict(x)
+        self.weights += self.lr * error * x
+        self.bias += self.lr * error
+
+learner = OnlineLearner(n_features=4)
+
+# ================= UTILITIES =================
 def calculate_ema(data, period):
     if len(data) < period:
         return None
-    alpha = 2 / (period + 1)
-    ema = data[0]
-    for p in data[1:]:
-        ema = alpha * p + (1 - alpha) * ema
-    return ema
+    series = pd.Series(data[-period:])
+    return series.ewm(span=period, adjust=False).mean().iloc[-1]
 
-# ================== SIGNAL ==================
-def extract_signal():
-    global armed
+def session_loss_check():
+    with lock:
+        return (MAX_BALANCE - BALANCE) < (MAX_BALANCE * MAX_DD)
 
-    if len(tick_buffer) < BUFFER_SIZE:
-        armed = False
+def calculate_dynamic_stake(confidence):
+    global consecutive_losses
+    stake = min(BASE_STAKE + confidence * BALANCE * TRADE_RISK_FRAC, MAX_STAKE)
+    if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+        stake = min(stake, BASE_STAKE)  # reduce risk after losing streak
+    return stake
+
+def extract_features():
+    if len(tick_buffer) < MICRO_SLICE:
         return None
-
     arr = np.array(tick_buffer)
+    return np.array([
+        calculate_ema(arr, EMA_FAST),
+        calculate_ema(arr, EMA_SLOW),
+        arr[-1] - arr[0],
+        arr.std()
+    ])
 
-    ema_fast = calculate_ema(arr, FAST_EMA)
-    ema_slow = calculate_ema(arr, SLOW_EMA)
+def record_trade_log(direction, stake, confidence, profit):
+    trade_log.appendleft({
+        "Direction": direction,
+        "Stake": f"{stake:.2f}",
+        "Confidence": f"{confidence:.2f}",
+        "Profit": f"{profit:.2f}"
+    })
 
-    if ema_fast is None or ema_slow is None:
-        armed = False
-        return None
+# ================= TRADING =================
+def evaluate_and_trade():
+    global last_proposal_time, TRADE_AMOUNT, last_direction
+    with lock:
+        if stop_bot or time.time() - last_proposal_time < PROPOSAL_COOLDOWN:
+            return
+        if not session_loss_check() or len(tick_history) < VOLATILITY_WINDOW:
+            return
+        if np.array(list(tick_history)[-VOLATILITY_WINDOW:]).std() < VOLATILITY_THRESHOLD:
+            return
 
-    armed = True
-    direction = "CALL" if ema_fast > ema_slow else "PUT"
-
-    spread = abs(ema_fast - ema_slow)
-    volatility = np.std(arr)
-    confidence = min(0.95, spread / (volatility + 1e-6))
-
-    return direction, confidence
-
-# ================== STAKE ==================
-def calculate_stake(conf):
-    global loss_bank, recovery_step
-
-    stake = BASE_STAKE * (1 + conf)
-
-    if loss_bank > 0 and conf >= RECOVERY_CONF:
-        stake += min(loss_bank * 0.5, BASE_STAKE * 1.5)
-        recovery_step += 1
-
-    if recovery_step >= MAX_RECOVERY_STEPS:
-        loss_bank = 0
-        recovery_step = 0
-
-    stake = min(stake, BASE_STAKE * MAX_RECOVERY_MULT)
-    stake = min(stake, MAX_STAKE)
-
-    return round(max(BASE_STAKE, stake), 2)
-
-# ================== TRADE ==================
-def try_trade():
-    global trade_in_progress, last_trade_time
-
-    if trade_in_progress:
+    features = extract_features()
+    if features is None:
         return
 
-    if time.time() - last_trade_time < TRADE_COOLDOWN:
-        return
+    direction = "up" if learner.predict(features) == 1 else "down"
+    confidence = 0.7
+    TRADE_AMOUNT = calculate_dynamic_stake(confidence)
 
-    signal = extract_signal()
-    if not signal:
-        return
+    with lock:
+        trade_queue.append((direction, 1, TRADE_AMOUNT))
+        last_proposal_time = time.time()
+        last_direction = direction
 
-    direction, conf = signal
-    if conf < CONF_THRESHOLD:
-        return
+    process_trade_queue()
 
-    stake = calculate_stake(conf)
+def process_trade_queue():
+    global trade_in_progress
+    with lock:
+        if trade_queue and not trade_in_progress:
+            direction, duration, stake = trade_queue.popleft()
+            send_proposal(direction, duration, stake)
 
-    console.log(
-        f"[bold green]📤 BUY {direction} | stake={stake:.2f} | conf={conf:.2f} | bank={loss_bank:.2f}[/bold green]"
-    )
-
-    ws.send(json.dumps({
-        "proposal": 1,
-        "amount": stake,
-        "basis": "stake",
-        "contract_type": direction,
-        "currency": "USD",
-        "duration": 1,
-        "duration_unit": "t",
-        "symbol": SYMBOL
-    }))
-
-    trade_in_progress = True
-    last_trade_time = time.time()
-
-# ================== RESULT ==================
-def handle_contract(data):
-    global trade_in_progress, loss_bank, recovery_step
-
-    c = data["proposal_open_contract"]
-    if not c.get("is_sold"):
-        return
-
-    profit = float(c["profit"])
-    trade_in_progress = False
-
-    if profit < 0:
-        loss_bank += abs(profit)
-        console.log(f"[red]❌ LOSS {profit:.2f} | bank={loss_bank:.2f}[/red]")
-    else:
-        console.log(f"[green]✅ WIN {profit:.2f} | recovered={loss_bank:.2f}[/green]")
-        loss_bank = 0
-        recovery_step = 0
-
-# ================== WS HANDLERS ==================
-def on_open(w):
-    global connected, reconnect_delay
-    connected = True
-    reconnect_delay = RECONNECT_DELAY
-    console.log("[green]✅ WebSocket OPEN[/green]")
-    w.send(json.dumps({"authorize": API_TOKEN}))
-
-def on_message(w, msg):
-    global last_tick_time
-
-    data = json.loads(msg)
-
-    if "authorize" in data:
-        console.log("[bold green]🔓 AUTHORIZED[/bold green]")
-        w.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
-        w.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
-        return
-
-    if "tick" in data:
-        price = float(data["tick"]["quote"])
-        last_tick_time = time.time()
-        tick_buffer.append(price)
-        console.log(f"[cyan]TICK {price:.4f}[/cyan]")
-        try_trade()
-
-    if "proposal" in data:
-        w.send(json.dumps({
-            "buy": data["proposal"]["id"],
-            "price": data["proposal"]["ask_price"]
+def send_proposal(direction, duration, stake):
+    global trade_in_progress
+    ct = "CALL" if direction == "up" else "PUT"
+    try:
+        ws.send(json.dumps({
+            "proposal": 1,
+            "amount": stake,
+            "basis": "stake",
+            "contract_type": ct,
+            "currency": "USD",
+            "duration": duration,
+            "duration_unit": "t",
+            "symbol": SYMBOL
         }))
+        console.log(f"[magenta]📤 Proposal sent {ct} | Stake=${stake:.2f}[/magenta]")
+        trade_in_progress = True
+    except Exception as e:
+        console.log(f"[red]Send proposal error: {e}[/red]")
+        trade_in_progress = False
 
-    if "proposal_open_contract" in data:
-        handle_contract(data)
+def on_contract_settlement(c):
+    global BALANCE, WINS, LOSSES, TRADE_COUNT, trade_in_progress, MAX_BALANCE, consecutive_losses
+    profit = float(c.get("profit") or 0)
+    with lock:
+        BALANCE += profit
+        MAX_BALANCE = max(MAX_BALANCE, BALANCE)
+        WINS += profit > 0
+        LOSSES += profit <= 0
+        TRADE_COUNT += 1
+        trade_in_progress = False
+        consecutive_losses = consecutive_losses + 1 if profit <= 0 else 0
+        record_trade_log(last_direction or "N/A", TRADE_AMOUNT, 0.7, profit)
+    log_trade(last_direction or "N/A", TRADE_AMOUNT, profit)
+    features = extract_features()
+    if features is not None:
+        learner.update(features, profit)
 
-def on_error(w, error):
-    console.log(f"[red]WS ERROR: {error}[/red]")
-
-def on_close(w, code, reason):
-    global connected
-    connected = False
-    console.log(f"[red]WS CLOSED | {code} | {reason}[/red]")
-
-# ================== CONNECT ==================
-def start_ws():
+# ================= WEBSOCKET =================
+def start_ws(retry=0):
     global ws
-    url = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-    console.log(f"[yellow]🌐 Connecting → {url}[/yellow]")
+    DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+    console.log(f"[yellow]Connecting to Deriv WebSocket at {DERIV_WS}[/yellow]")
+
+    def on_open(w):
+        console.log("[green]WebSocket connected[/green]")
+        w.send(json.dumps({"authorize": API_TOKEN}))
+
+    def on_message(ws, msg):
+        try:
+            data = json.loads(msg)
+            if "authorize" in data and not data["authorize"].get("error"):
+                console.log("[green]✅ Authorized[/green]")
+                ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
+                ws.send(json.dumps({"balance": 1, "subscribe": 1}))
+                ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
+            if "tick" in data:
+                tick = float(data["tick"]["quote"])
+                tick_history.append(tick)
+                tick_buffer.append(tick)
+                evaluate_and_trade()
+            if "proposal" in data:
+                time.sleep(PROPOSAL_DELAY)
+                ws.send(json.dumps({"buy": data["proposal"]["id"], "price": TRADE_AMOUNT}))
+            if "proposal_open_contract" in data:
+                c = data["proposal_open_contract"]
+                if c.get("is_sold") or c.get("is_expired"):
+                    on_contract_settlement(c)
+            if "balance" in data:
+                global BALANCE
+                with lock:
+                    BALANCE = float(data["balance"]["balance"])
+        except Exception as e:
+            console.log(f"[red]on_message error: {e}[/red]")
+
+    def on_error(ws, error):
+        console.log(f"[red]WebSocket ERROR: {error}[/red]")
+
+    def on_close(ws, code, msg):
+        console.log(f"[red]WebSocket closed | Code: {code} | Msg: {msg}[/red]")
+        time.sleep(min(2 ** retry, 30))  # exponential backoff
+        start_ws(retry + 1)
 
     ws = websocket.WebSocketApp(
-        url,
+        DERIV_WS,
         on_open=on_open,
         on_message=on_message,
         on_error=on_error,
         on_close=on_close
     )
-
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
-# ================== WATCHDOG ==================
-def watchdog():
-    global reconnect_delay, connected
+# ================= DASHBOARD =================
+def dashboard_loop():
+    with Live(auto_refresh=True, refresh_per_second=1) as live:
+        last_trade_count = -1
+        while True:
+            table = Table(title="🚀 Momento Bot Dashboard [AGGRESSIVE MODE]")
+            table.add_column("Metric", justify="left")
+            table.add_column("Value", justify="right")
+            with lock:
+                table.add_row("Balance", f"{BALANCE:.2f}")
+                table.add_row("Max Balance", f"{MAX_BALANCE:.2f}")
+                table.add_row("Trades", str(TRADE_COUNT))
+                table.add_row("Wins", str(WINS))
+                table.add_row("Losses", str(LOSSES))
+                table.add_row("Consecutive Losses", str(consecutive_losses))
+            if TRADE_COUNT == last_trade_count:
+                table.add_row("❤️ HEARTBEAT", datetime.now().strftime("%H:%M:%S") + " | No new trades")
+            else:
+                last_trade_count = TRADE_COUNT
+                table.add_row("✅ Last Trade Update", f"Balance={BALANCE:.2f}")
+            # Last trades
+            trade_table = Table()
+            trade_table.add_column("Dir")
+            trade_table.add_column("Stake")
+            trade_table.add_column("Conf")
+            trade_table.add_column("Profit")
+            with lock:
+                for t in trade_log:
+                    profit = float(t["Profit"])
+                    profit_text = Text(f"{profit:.2f}")
+                    if profit > 0: profit_text.stylize("green")
+                    elif profit < 0: profit_text.stylize("red")
+                    trade_table.add_row(t["Direction"], t["Stake"], t["Confidence"], profit_text)
+            table.add_row("", trade_table)
+            live.update(table)
+            time.sleep(1)
 
+# ================= START =================
+if __name__ == "__main__":
+    console.print("[green]🚀 Momento Bot starting on Koyeb [AGGRESSIVE MODE] with safety upgrades[/green]")
+    start_ws()
+    threading.Thread(target=dashboard_loop, daemon=True).start()
     while True:
-        now = time.time()
-
-        if connected and now - last_tick_time > TICK_TIMEOUT:
-            console.log("[bold red]⚠ TICK TIMEOUT → RECONNECT[/bold red]")
-            try:
-                ws.close()
-            except:
-                pass
-            connected = False
-
-        if not connected:
-            console.log(f"[yellow]🔁 Reconnecting in {reconnect_delay}s[/yellow]")
-            time.sleep(reconnect_delay)
-            start_ws()
-            reconnect_delay = min(reconnect_delay * 2, MAX_RECONNECT_DELAY)
-
-        state = "ARMED 🟢" if armed else "WARMING 🔵"
-        console.log(
-            f"❤️ HEARTBEAT | {state} | ticks={len(tick_buffer)} | bank={loss_bank:.2f} | step={recovery_step}"
-        )
-
-        time.sleep(HEARTBEAT_INTERVAL)
-
-# ================== START ==================
-if not API_TOKEN or not APP_ID:
-    raise RuntimeError("❌ Missing API_TOKEN or APP_ID")
-
-console.log("[bold cyan]🚀 MOMENTO BOT STARTING (REAL TRADING)[/bold cyan]")
-
-threading.Thread(target=watchdog, daemon=True).start()
-start_ws()
-
-while True:
-    time.sleep(10)
+        time.sleep(5)
