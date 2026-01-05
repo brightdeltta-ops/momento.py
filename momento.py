@@ -26,7 +26,7 @@ EMA_SLOW = 10
 MICRO_SLICE = 10
 
 VOLATILITY_WINDOW = 15
-VOLATILITY_THRESHOLD = 0.0003  # lower to allow more trades at startup
+VOLATILITY_THRESHOLD = 0.0003
 MAX_DD = 0.25
 LOSS_STREAK_LIMIT = 3
 
@@ -53,6 +53,28 @@ loss_streak = 0
 ws = None
 lock = threading.Lock()
 console = Console()
+
+# ================= LOGGING HELPERS =================
+def log_tick(tick):
+    ts = datetime.now().strftime("%H:%M:%S")
+    console.log(f"[bold cyan][{ts}] TICK {tick:.4f}[/bold cyan]")
+
+def log_trade(direction, stake, profit):
+    ts = datetime.now().strftime("%H:%M:%S")
+    if profit > 0:
+        console.log(f"[green][{ts}] ✅ Trade {direction} | Stake=${stake:.2f} | Profit=${profit:.2f}[/green]")
+    elif profit < 0:
+        console.log(f"[red][{ts}] ❌ Trade {direction} | Stake=${stake:.2f} | Loss=${profit:.2f}[/red]")
+    else:
+        console.log(f"[yellow][{ts}] ⚪ Trade {direction} | Stake=${stake:.2f} | Break-even[/yellow]")
+
+def log_proposal(direction, stake):
+    ts = datetime.now().strftime("%H:%M:%S")
+    console.log(f"[magenta][{ts}] 📤 Proposal sent {direction.upper()} | Stake=${stake:.2f}[/magenta]")
+
+def log_heartbeat():
+    ts = datetime.now().strftime("%H:%M:%S")
+    console.log(f"[blue][{ts}] ❤️ HEARTBEAT: Bot running, no new trades[/blue]")
 
 # ================= ONLINE LEARNER =================
 class OnlineLearner:
@@ -115,7 +137,7 @@ def extract_features():
     if len(tick_buffer) < MICRO_SLICE:
         return None
     arr = np.array(tick_buffer)
-    arr_smooth = arr * 0.7 + np.mean(arr) * 0.3  # faster reaction smoothing
+    arr_smooth = arr * 0.7 + np.mean(arr) * 0.3
     arr_std = arr_smooth.std() or 1e-8
     return np.array([
         calculate_ema(arr_smooth, EMA_FAST),
@@ -142,8 +164,7 @@ def evaluate_and_trade():
         return
 
     recent_vol = np.array(list(tick_history)[-VOLATILITY_WINDOW:]).std()
-    vol_threshold = VOLATILITY_THRESHOLD
-    if recent_vol < vol_threshold:
+    if recent_vol < VOLATILITY_THRESHOLD:
         return
 
     features = extract_features()
@@ -152,11 +173,10 @@ def evaluate_and_trade():
 
     direction, confidence = learner.predict_confidence(features)
 
-    # ===== STARTUP EXPLORATION MODE =====
+    # Startup exploration
     if TRADE_COUNT < 10:
-        confidence = 0.7  # force trades to gather learning data
+        confidence = 0.7
 
-    # allow lower confidence to start trading
     if confidence < 0.1:
         return
 
