@@ -3,6 +3,7 @@ from collections import deque
 from rich.console import Console
 from rich.table import Table
 from rich.live import Live
+from rich.text import Text
 from datetime import datetime
 
 # ================= CONFIG =================
@@ -26,10 +27,8 @@ MICRO_SLICE = 10
 
 VOL_WINDOW = 15
 VOL_THRESHOLD = 0.00025
-MAX_DD = 0.15             # Reduced drawdown to protect capital
+MAX_DD = 0.25
 LOSS_STREAK_LIMIT = 3
-
-PROFIT_LOCK_PERCENT = 0.10  # Auto-stop if balance drops 10% from peak
 
 STATE_FILE = "learner_state.pkl"
 
@@ -40,8 +39,8 @@ trade_queue = deque(maxlen=20)
 trade_log = deque(maxlen=10)
 
 BALANCE = 0.0
-MAX_BALANCE = 0.0
 PEAK_BALANCE = 0.0
+MAX_BALANCE = 0.0
 WINS = 0
 LOSSES = 0
 TRADE_COUNT = 0
@@ -103,7 +102,7 @@ class OnlineLearner:
 learner = OnlineLearner(4)
 learner.load()
 
-# ================= UTILITIES =================
+# ================= UTIL =================
 def ema(data, p):
     if len(data) < p:
         return 0.0
@@ -129,30 +128,37 @@ def dynamic_stake(conf):
     return min(max(stake, BASE_STAKE), MAX_STAKE)
 
 def session_ok():
+    global AUTO_STOP
+    if AUTO_STOP:
+        return False
     return MAX_BALANCE == 0 or (MAX_BALANCE - BALANCE) < MAX_BALANCE * MAX_DD
+
+# ================= AUTO RESUME =================
+RESUME_THRESHOLD = 0.85
+def check_resume():
+    global AUTO_STOP
+    if AUTO_STOP and BALANCE >= PEAK_BALANCE * RESUME_THRESHOLD:
+        AUTO_STOP = False
+        console.log("[green]✅ Drawdown recovered — Resuming trading[/green]")
 
 # ================= TRADING =================
 def evaluate():
-    global last_proposal_time, TRADE_AMOUNT, last_direction, PEAK_BALANCE, AUTO_STOP
+    global last_proposal_time, TRADE_AMOUNT, last_direction, AUTO_STOP, PEAK_BALANCE
 
-    # Profit Lock Auto-Stop
-    if BALANCE < PEAK_BALANCE * (1 - PROFIT_LOCK_PERCENT):
-        if not AUTO_STOP:
-            console.log(f"[yellow]⚠️  Auto-Stop Triggered | Balance dropped below profit lock[/yellow]")
-        AUTO_STOP = True
-        return
-    else:
-        AUTO_STOP = False
+    PEAK_BALANCE = max(PEAK_BALANCE, BALANCE)
 
-    if trade_in_progress or AUTO_STOP:
+    check_resume()
+
+    if trade_in_progress or time.time() - last_proposal_time < PROPOSAL_COOLDOWN:
         return
-    if time.time() - last_proposal_time < PROPOSAL_COOLDOWN:
-        return
+
     if not session_ok():
+        if not AUTO_STOP:
+            AUTO_STOP = True
+            console.log(f"[red]⚠️ Max drawdown reached. Halting trading at balance {BALANCE:.2f}[/red]")
         return
-    if len(tick_history) < VOL_WINDOW:
-        return
-    if np.std(list(tick_history)[-VOL_WINDOW:]) < VOL_THRESHOLD:
+
+    if len(tick_history) < VOL_WINDOW or np.std(list(tick_history)[-VOL_WINDOW:]) < VOL_THRESHOLD:
         return
 
     f = features()
@@ -160,6 +166,7 @@ def evaluate():
         return
 
     direction, conf = learner.predict(f)
+
     if TRADE_COUNT < 10:
         conf = 0.7
     if conf < 0.1:
@@ -169,7 +176,6 @@ def evaluate():
     trade_queue.append((direction, 1, TRADE_AMOUNT))
     last_direction = direction
     last_proposal_time = time.time()
-    PEAK_BALANCE = max(PEAK_BALANCE, BALANCE)
     process_queue()
 
 def process_queue():
@@ -195,10 +201,11 @@ def send_proposal(d, dur, s):
     trade_in_progress = True
 
 def settle(c):
-    global BALANCE, MAX_BALANCE, WINS, LOSSES, TRADE_COUNT, LOSS_STREAK, trade_in_progress
+    global BALANCE, PEAK_BALANCE, MAX_BALANCE, WINS, LOSSES, TRADE_COUNT, LOSS_STREAK, trade_in_progress
 
     profit = float(c.get("profit", 0))
     BALANCE += profit
+    PEAK_BALANCE = max(PEAK_BALANCE, BALANCE)
     MAX_BALANCE = max(MAX_BALANCE, BALANCE)
     TRADE_COUNT += 1
     LOSS_STREAK = LOSS_STREAK + 1 if profit <= 0 else 0
@@ -214,7 +221,7 @@ def settle(c):
         learner.save()
 
 # ================= WEBSOCKET =================
-def resubscribe():
+def resub():
     ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
     ws.send(json.dumps({"balance": 1, "subscribe": 1}))
     ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
@@ -222,7 +229,7 @@ def resubscribe():
 def start_ws():
     global ws
     url = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-    console.log(f"[yellow]Connecting {url}[/yellow]")
+    console.log(f"Connecting {url}")
 
     def on_open(w):
         w.send(json.dumps({"authorize": API_TOKEN}))
@@ -232,7 +239,7 @@ def start_ws():
             d = json.loads(msg)
 
             if "authorize" in d and not d["authorize"].get("error"):
-                resubscribe()
+                resub()
 
             if "tick" in d:
                 t = float(d["tick"]["quote"])
@@ -273,13 +280,13 @@ def dashboard():
             t.add_column("Metric")
             t.add_column("Value")
             t.add_row("Balance", f"{BALANCE:.2f}")
+            t.add_row("Peak Balance", f"{PEAK_BALANCE:.2f}")
             t.add_row("Max Balance", f"{MAX_BALANCE:.2f}")
             t.add_row("Trades", str(TRADE_COUNT))
             t.add_row("Wins", str(WINS))
             t.add_row("Losses", str(LOSSES))
             t.add_row("Loss Streak", str(LOSS_STREAK))
-            t.add_row("Peak Balance", f"{PEAK_BALANCE:.2f}")
-            t.add_row("Auto-Stop", str(AUTO_STOP))
+            t.add_row("AUTO_STOP", str(AUTO_STOP))
 
             if TRADE_COUNT == last:
                 log_heartbeat()
