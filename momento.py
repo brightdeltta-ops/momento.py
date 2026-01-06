@@ -7,24 +7,27 @@ from rich.live import Live
 # ================= CONFIG =================
 API_TOKEN = os.getenv("DERIV_API_TOKEN")
 APP_ID = int(os.getenv("APP_ID", "0"))
+VOLUME_PATH = "/mnt/volume"  # Koyeb persistent volume
 
 if not API_TOKEN or not APP_ID:
     raise RuntimeError("Missing DERIV_API_TOKEN or APP_ID")
 
 SYMBOL = "R_75"
 BASE_STAKE = 1.0
-MAX_STAKE = 50.0  # safer max stake
+MAX_STAKE = 50.0
 RISK_FRAC = 0.05
 MICRO_SLICE = 10
 EMA_FAST = 3
 EMA_SLOW = 10
 VOL_WINDOW = 15
 VOL_THRESHOLD = 0.00025
-MAX_DD = 0.25  # stop trading after 25% drawdown
+MAX_DD = 0.25
 LOSS_STREAK_LIMIT = 3
-STATE_FILE = "learner_state.pkl"
 PROPOSAL_COOLDOWN = 2
 PROPOSAL_DELAY = 2
+
+STATE_FILE = os.path.join(VOLUME_PATH, "learner_state.pkl")
+LOG_FILE = os.path.join(VOLUME_PATH, "trades.log")
 
 # ================= STATE =================
 tick_history = deque(maxlen=500)
@@ -52,8 +55,7 @@ class OnlineLearner:
 
     def predict(self, x):
         z = np.dot(self.w, x) + self.b
-        # Cap z to avoid overflow
-        z = max(min(z, 100), -100)
+        z = max(min(z, 100), -100)  # prevent overflow
         p = 1 / (1 + np.exp(-z))
         conf = abs(p - 0.5) * 2
         return ("up" if z > 0 else "down"), conf
@@ -67,6 +69,7 @@ class OnlineLearner:
         self.b += self.lr * err
 
     def save(self):
+        os.makedirs(VOLUME_PATH, exist_ok=True)
         with open(STATE_FILE, "wb") as f:
             pickle.dump((self.w, self.b), f)
 
@@ -90,12 +93,7 @@ def features():
     if len(tick_buffer) < MICRO_SLICE:
         return None
     a = np.array(tick_buffer)
-    return np.array([
-        ema(a, EMA_FAST),
-        ema(a, EMA_SLOW),
-        a[-1] - a[0],
-        max(a.std(), 1e-6)
-    ])
+    return np.array([ema(a, EMA_FAST), ema(a, EMA_SLOW), a[-1]-a[0], max(a.std(), 1e-6)])
 
 def dynamic_stake(conf):
     stake = BASE_STAKE + conf * BALANCE * RISK_FRAC
@@ -110,6 +108,11 @@ def session_ok():
     dd = (MAX_BALANCE - BALANCE) / MAX_BALANCE
     return dd < MAX_DD
 
+def log_trade_file(direction, stake, profit, balance):
+    os.makedirs(VOLUME_PATH, exist_ok=True)
+    with open(LOG_FILE, "a") as f:
+        f.write(f"{time.time()} | {direction} | Stake {stake:.2f} | P/L {profit:.2f} | Balance {balance:.2f}\n")
+
 # ================= TRADING =================
 def evaluate():
     global last_proposal_time, TRADE_AMOUNT, last_direction
@@ -123,17 +126,14 @@ def evaluate():
         return
     if np.std(list(tick_history)[-VOL_WINDOW:]) < VOL_THRESHOLD:
         return
-
     f = features()
     if f is None:
         return
-
     direction, conf = learner.predict(f)
     if TRADE_COUNT < 10:
-        conf = 0.7  # give early trades more confidence
+        conf = 0.7
     if conf < 0.1:
         return
-
     TRADE_AMOUNT = dynamic_stake(conf)
     trade_queue.append((direction, 1, TRADE_AMOUNT))
     last_direction = direction
@@ -171,7 +171,7 @@ def settle(c):
     LOSS_STREAK = LOSS_STREAK + 1 if profit <= 0 else 0
     trade_in_progress = False
     console.log(f"[green]Trade result: P/L {profit:.2f} | Balance {BALANCE:.2f}[/green]")
-
+    log_trade_file(last_direction, TRADE_AMOUNT, profit, BALANCE)
     f = features()
     if f is not None:
         learner.update(f, profit)
@@ -188,8 +188,7 @@ def start_ws():
     url = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
     console.log(f"Connecting {url}")
 
-    def on_open(w):
-        w.send(json.dumps({"authorize": API_TOKEN}))
+    def on_open(w): w.send(json.dumps({"authorize": API_TOKEN}))
 
     def on_message(w, msg):
         try:
@@ -222,7 +221,7 @@ def dashboard():
     with Live(refresh_per_second=1) as live:
         last = -1
         while True:
-            t = Table(title="🚀 MOMENTO BOT — SAFE PROFIT MODE")
+            t = Table(title="🚀 MOMENTO BOT — NEXT-GEN SAFE MODE")
             t.add_column("Metric")
             t.add_column("Value")
             t.add_row("Balance", f"{BALANCE:.2f}")
@@ -237,7 +236,7 @@ def dashboard():
 
 # ================= START =================
 if __name__ == "__main__":
-    console.print("[green]🚀 MOMENTO BOT STARTED — KOYEB SAFE MODE[/green]")
+    console.print("[green]🚀 MOMENTO BOT STARTED — NEXT-GEN ALPHA[/green]")
     while True:
         try:
             start_ws()
