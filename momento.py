@@ -1,8 +1,15 @@
-import json, threading, time, websocket, numpy as np, os
+import websocket
+import json
+import threading
+import time
+import numpy as np
+import os
 from collections import deque
 from datetime import datetime
 
-# ================= CONFIG =================
+# ============================================================
+# CONFIG (Koyeb ENVIRONMENT VARIABLES)
+# ============================================================
 API_TOKEN = os.getenv("DERIV_API_TOKEN")
 APP_ID = int(os.getenv("APP_ID", "0"))
 SYMBOL = os.getenv("SYMBOL", "R_75")
@@ -10,241 +17,268 @@ SYMBOL = os.getenv("SYMBOL", "R_75")
 if not API_TOKEN or not APP_ID:
     raise RuntimeError("Missing DERIV_API_TOKEN or APP_ID environment variables")
 
-# Trading Parameters
+# Trading parameters
 BASE_STAKE = 1.0
-MAX_STAKE = 20.0
+MAX_STAKE = 100.0
 TRADE_RISK_FRAC = 0.02
-PROPOSAL_COOLDOWN = 1        # aggressive
-PROPOSAL_DELAY = 0.5         # aggressive
-EMA_FAST = 2
-EMA_SLOW = 6
-EMA_PULLBACK_FAST = 8
-EMA_PULLBACK_SLOW = 50
-MICRO_SLICE = 6
-CONFIDENCE_THRESHOLD = 0.25
+EMA_FAST_BASE = 6
+EMA_SLOW_BASE = 13
+EMA_CONF = 30
+MIN_TICKS = 15
+PROPOSAL_COOLDOWN = 0.2
+MIN_TRADE_INTERVAL = 4
+LOW_CONF_WAIT = 30  # idle seconds before low-confidence trade
 
-# Volatility adaptive
-VOL_LOOKBACK = 12
-
-# ================= STATE =================
-tick_history = deque(maxlen=500)
-tick_buffer = deque(maxlen=MICRO_SLICE)
-trade_queue = deque(maxlen=30)
+# ============================================================
+# STATE
+# ============================================================
+tick_history = deque(maxlen=300)
+equity_curve = []
+alerts = deque(maxlen=50)
+trade_queue = deque(maxlen=50)
 active_trades = []
 
 BALANCE = 1000.0
 WINS = 0
 LOSSES = 0
 TRADE_COUNT = 0
-TRADE_AMOUNT = BASE_STAKE
 
 trade_in_progress = False
 last_trade_time = 0
 last_proposal_time = 0
+TRADE_AMOUNT = BASE_STAKE
+next_trade_signal = None
+
 authorized = False
 ws_running = False
 ws = None
 lock = threading.Lock()
-
-alerts = deque(maxlen=50)
-equity_curve = []
-
 DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
-# ================= LOGGING =================
+# ============================================================
+# LOGGING / ALERTS
+# ============================================================
 def log(msg):
     with lock:
         alerts.appendleft(f"[{datetime.utcnow().isoformat()}] {msg}")
-        print(f"[{datetime.utcnow().isoformat()}] {msg}", flush=True)
+    print(f"[{datetime.utcnow().isoformat()}] {msg}", flush=True)
 
-# ================= UTILITIES =================
+def safe_ws_send(msg):
+    try:
+        if ws is not None:
+            ws.send(json.dumps(msg))
+    except Exception as e:
+        log(f"⚠ WS send error: {e}")
+
+# ============================================================
+# UTILITY FUNCTIONS
+# ============================================================
 def calculate_ema(data, period):
     if len(data) < period:
         return None
-    w = np.exp(np.linspace(-1.,0.,period))
-    w /= w.sum()
-    return np.convolve(data[-period:], w, mode="valid")[0]
+    weights = np.exp(np.linspace(-1.,0.,period))
+    weights /= weights.sum()
+    return np.convolve(data[-period:], weights, mode='valid')[0]
 
-def adaptive_stake(confidence=1.0):
-    if len(tick_history) < VOL_LOOKBACK:
-        return BASE_STAKE
-    recent = np.array(list(tick_history)[-VOL_LOOKBACK:])
-    vol = recent.std()
-    stake = BASE_STAKE * (1 + vol*100) * confidence
-    stake = max(BASE_STAKE, min(stake, MAX_STAKE))
-    return stake
+def quant_distribution_factor(window=30):
+    if len(tick_history) < window:
+        return 1.0
+    recent_ticks = np.array(list(tick_history)[-window:])
+    mean = np.mean(recent_ticks)
+    std = np.std(recent_ticks)
+    current = recent_ticks[-1]
+    z = (current - mean) / (std + 1e-8)
+    return np.clip(1.0 + np.tanh(z), 0.5, 2.0)
 
-def session_loss_check():
-    return LOSSES*BASE_STAKE < 50
+def quant_trend_strength(window=15):
+    if len(tick_history) < window:
+        return 0.0
+    recent = np.array(list(tick_history)[-window:])
+    x = np.arange(len(recent))
+    slope = np.polyfit(x, recent, 1)[0]
+    std = np.std(recent)
+    return slope / (std + 1e-8)
 
-def get_breakout_confidence():
-    if len(tick_buffer) < 5:
-        return None, 0
-    recent = np.array(tick_buffer)
-    high, low = recent.max(), recent.min()
-    rng = high - low
-    std = recent.std()
-    if rng < 0.001:
-        return None, 0
-    current = recent[-1]
-    if current >= high - 0.2*rng:
-        return "up", min(1, std*200)
-    if current <= low + 0.2*rng:
-        return "down", min(1, std*200)
-    momentum = current - recent[-3]
-    return ("up" if momentum>0 else "down", min(1, abs(momentum)*150))
+def numeric_trade_grade():
+    if len(tick_history) < MIN_TICKS:
+        return 0.0
+    recent = np.array(list(tick_history)[-MIN_TICKS:])
+    ema_f = calculate_ema(recent, EMA_FAST_BASE)
+    ema_s = calculate_ema(recent, EMA_SLOW_BASE)
+    ema_c = calculate_ema(recent, EMA_CONF)
+    trend_score = quant_trend_strength()
+    ema_score = (ema_f - ema_s) / (np.mean(recent)+1e-8)
+    quant_factor = quant_distribution_factor()
+    momentum = (recent[-1] - recent[-2]) / (recent[-2]+1e-8)
+    grade = trend_score*0.45 + ema_score*0.3 + (quant_factor-1)*0.15 + momentum*0.1
+    recent_vol = np.std(recent)
+    dynamic_threshold = 0.02 * (1 + recent_vol*2)
+    return grade if abs(grade) > dynamic_threshold else 0.0
 
-def ema_pullback_signal(prices):
-    if len(prices) < EMA_PULLBACK_SLOW:
-        return None
-    data = np.array(prices)
-    ema_fast = data[-EMA_PULLBACK_FAST:].mean()
-    ema_slow = data[-EMA_PULLBACK_SLOW:].mean()
-    last = data[-1]
-    prev = data[-2]
-    if last > ema_slow and prev < ema_fast and last > ema_fast:
-        return "up"
-    elif last < ema_slow and prev > ema_fast and last < ema_fast:
-        return "down"
-    return None
+def calculate_trade_amount(grade):
+    recent = np.array(list(tick_history)[-20:])
+    vol = np.std(recent)/np.mean(recent) if len(recent) >= 2 else 0.01
+    stake = BASE_STAKE*(0.05/max(vol,0.01))
+    stake = min(stake, MAX_STAKE, BALANCE*TRADE_RISK_FRAC)
+    stake *= quant_distribution_factor()
+    stake *= min(abs(grade)*3, 3.0)
+    return max(stake, BASE_STAKE)
 
-# ================= TRADE LOGIC =================
+# ============================================================
+# TRADE LOGIC
+# ============================================================
 def evaluate_and_trade():
-    global last_proposal_time, TRADE_AMOUNT
-    if time.time() - last_proposal_time < PROPOSAL_COOLDOWN:
+    global last_proposal_time, TRADE_AMOUNT, last_trade_time
+    now = time.time()
+    if now - last_proposal_time < PROPOSAL_COOLDOWN:
         return
-    if not session_loss_check():
+    if now - last_trade_time < MIN_TRADE_INTERVAL:
         return
-    direction, confidence = get_breakout_confidence()
-    if direction is None or confidence < CONFIDENCE_THRESHOLD:
+    if len(tick_history) < MIN_TICKS:
         return
-    short_ema = calculate_ema(list(tick_buffer), EMA_FAST)
-    long_ema = calculate_ema(list(tick_buffer), EMA_SLOW)
-    if short_ema is None or long_ema is None:
-        return
-    ema_trend = "up" if short_ema > long_ema else "down"
-    if direction != ema_trend:
-        return
-    pullback = ema_pullback_signal(list(tick_history))
-    if pullback:
-        direction = pullback
-    TRADE_AMOUNT = adaptive_stake(confidence)
-    trade_queue.append((direction,1,TRADE_AMOUNT))
-    last_proposal_time = time.time()
-    process_trade_queue()
-    log(f"🚀 Queued {direction.upper()} | Stake {TRADE_AMOUNT:.2f} | Conf {confidence:.2f}")
+    grade = numeric_trade_grade()
+    direction = "RISE" if grade > 0 else "FALL"
+    if grade == 0 and now - last_trade_time > LOW_CONF_WAIT:
+        grade = 0.01
+        TRADE_AMOUNT = BASE_STAKE
+        log("⚡ Low-confidence fire mode triggered!")
+    if grade != 0:
+        TRADE_AMOUNT = calculate_trade_amount(grade)
+        trade_queue.append((direction, grade, TRADE_AMOUNT))
+        last_proposal_time = now
+        process_trade_queue()
+    else:
+        log("⚠ Skipping weak trade grade")
 
 def process_trade_queue():
-    global trade_in_progress
+    global next_trade_signal
     if trade_queue and not trade_in_progress:
-        sig = trade_queue.popleft()
-        request_proposal(sig)
+        direction, grade, stake = trade_queue.popleft()
+        next_trade_signal = direction
+        request_proposal(direction, grade, stake)
 
-def request_proposal(sig):
-    global TRADE_AMOUNT, trade_in_progress, last_trade_time
-    direction,duration,stake = sig
-    TRADE_AMOUNT = stake
-    ct = "CALL" if direction=="up" else "PUT"
+def request_proposal(direction, grade, stake):
+    global trade_in_progress, TRADE_AMOUNT, last_trade_time
+    ct = "CALL" if direction=="RISE" else "PUT"
     proposal = {
-        "proposal":1,
-        "amount":TRADE_AMOUNT,
-        "basis":"stake",
-        "contract_type":ct,
-        "currency":"USD",
-        "duration":duration,
-        "duration_unit":"t",
-        "symbol":SYMBOL
+        "proposal": 1,
+        "amount": stake,
+        "basis": "stake",
+        "contract_type": ct,
+        "currency": "USD",
+        "duration": 2,
+        "duration_unit": "t",
+        "symbol": SYMBOL
     }
     trade_in_progress = True
     last_trade_time = time.time()
-    ws.send(json.dumps(proposal))
-    log(f"📨 Proposal sent → {direction.upper()} | Stake {TRADE_AMOUNT:.2f}")
+    log(f"📨 Proposal → {direction} | Stake {stake:.2f} | Grade {grade:.4f}")
+    safe_ws_send(proposal)
 
-def on_contract_settlement(c):
-    global BALANCE,WINS,LOSSES,TRADE_COUNT,trade_in_progress
-    profit = float(c.get("profit") or 0)
+def on_contract_settlement(contract):
+    global BALANCE, WINS, LOSSES, TRADE_COUNT, trade_in_progress
+    profit = float(contract.get("profit") or 0)
     BALANCE += profit
     equity_curve.append(BALANCE)
     if profit > 0: WINS += 1
     else: LOSSES += 1
     TRADE_COUNT += 1
     trade_in_progress = False
-    log(f"✔ Settlement → Profit: {profit:.2f} | Next Stake: {BASE_STAKE:.2f}")
+    log(f"✔ Settlement: {profit:.2f} | Next Stake {TRADE_AMOUNT:.2f}")
     process_trade_queue()
 
-# ================= WEBSOCKET =================
-def on_message(ws,msg):
-    global BALANCE,authorized
+# ============================================================
+# WEBSOCKET HANDLER
+# ============================================================
+def on_message(ws_obj, msg):
+    global BALANCE, authorized
     try:
-        data=json.loads(msg)
+        data = json.loads(msg)
         if "authorize" in data:
-            authorized=True
-            resubscribe_channels()
+            authorized = True
+            safe_ws_send({"ticks": SYMBOL, "subscribe": 1})
+            safe_ws_send({"balance": 1, "subscribe": 1})
+            safe_ws_send({"proposal_open_contract": 1, "subscribe": 1})
             log("✔ Authorized")
         if "tick" in data:
-            tick=float(data["tick"]["quote"])
+            tick = float(data["tick"]["quote"])
             tick_history.append(tick)
-            tick_buffer.append(tick)
             evaluate_and_trade()
+        if "balance" in data:
+            BALANCE = float(data["balance"]["balance"])
+            equity_curve.append(BALANCE)
         if "proposal" in data:
-            pid=data["proposal"]["id"]
-            time.sleep(PROPOSAL_DELAY)
-            ws.send(json.dumps({"buy":pid,"price":TRADE_AMOUNT}))
-            active_trades.append({"id":pid,"profit":0})
+            pid = data["proposal"]["id"]
+            time.sleep(0.01)
+            safe_ws_send({"buy": pid, "price": TRADE_AMOUNT})
+            active_trades.append(pid)
+            log("✔ BUY sent")
         if "proposal_open_contract" in data:
-            c=data["proposal_open_contract"]
+            c = data["proposal_open_contract"]
             if c.get("is_sold") or c.get("is_expired"):
                 on_contract_settlement(c)
-                active_trades[:] = [t for t in active_trades if t["id"]!=c.get("id")]
-        if "balance" in data:
-            BALANCE=float(data["balance"]["balance"])
-            equity_curve.append(BALANCE)
+                active_trades[:] = [t for t in active_trades if t != c.get("id")]
     except Exception as e:
-        log(f"⚠ WS Error: {e}")
+        log(f"⚠ WS Handler Error: {e}")
 
-def resubscribe_channels():
-    if not authorized: return
-    ws.send(json.dumps({"ticks":SYMBOL,"subscribe":1}))
-    ws.send(json.dumps({"balance":1,"subscribe":1}))
-    ws.send(json.dumps({"proposal_open_contract":1,"subscribe":1}))
-    log("🔄 Resubscribed to all channels")
-
-def on_error(ws,error):
-    log(f"❌ WS Error: {error}")
-
-def on_close(ws,code,msg):
-    log("❌ WS Closed — reconnecting in 2s")
-    time.sleep(2)
-    start_ws()
-
+# ============================================================
+# WEBSOCKET BOOT
+# ============================================================
 def start_ws():
-    global ws, ws_running, authorized
+    global ws, ws_running
     if ws_running: return
-    ws_running=True
-    authorized=False
-    ws=websocket.WebSocketApp(
-        DERIV_WS,
-        on_open=lambda ws: ws.send(json.dumps({"authorize":API_TOKEN})),
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close
-    )
-    threading.Thread(target=ws.run_forever,daemon=True).start()
-    log("🌐 WebSocket started")
+    ws_running = True
+
+    def run_ws():
+        global ws
+        while True:
+            try:
+                ws = websocket.WebSocketApp(
+                    DERIV_WS,
+                    on_open=lambda ws_obj: safe_ws_send({"authorize": API_TOKEN}),
+                    on_message=on_message,
+                    on_error=lambda ws_obj, err: log(f"❌ WS Error: {err}"),
+                    on_close=lambda *args: log("❌ WS Closed")
+                )
+                ws.run_forever()
+            except Exception as e:
+                log(f"⚠ WS reconnect error: {e}")
+                time.sleep(2)
+    threading.Thread(target=run_ws, daemon=True).start()
 
 def keep_alive():
     while True:
         time.sleep(15)
-        try: ws.send(json.dumps({"ping":1}))
-        except: pass
+        safe_ws_send({"ping": 1})
 
-# ================= START =================
+def auto_unfreeze():
+    global trade_in_progress, last_trade_time
+    while True:
+        time.sleep(1)
+        if trade_in_progress and time.time() - last_trade_time > 5:
+            trade_in_progress = False
+            log("⚠ Auto-unfreeze: Trade reset")
+            process_trade_queue()
+
+# ============================================================
+# HEARTBEAT
+# ============================================================
+def heartbeat():
+    while True:
+        time.sleep(30)
+        log("❤️ HEARTBEAT")
+
+# ============================================================
+# START BOT
+# ============================================================
 def start():
-    log("🚀 EMA BREAKOUT + PULLBACK BOT — KOYEB READY (ENV COMPATIBLE)")
+    log("🚀 FIRE FIXED BOT — KOYEB READY (ENV COMPATIBLE)")
     start_ws()
-    threading.Thread(target=keep_alive,daemon=True).start()
+    threading.Thread(target=keep_alive, daemon=True).start()
+    threading.Thread(target=auto_unfreeze, daemon=True).start()
+    threading.Thread(target=heartbeat, daemon=True).start()
     while True:
         time.sleep(5)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     start()
