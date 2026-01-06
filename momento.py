@@ -1,7 +1,6 @@
 import os, json, threading, time, websocket, numpy as np
 from collections import deque
 from datetime import datetime, timezone
-import pandas as pd
 
 # ================= CONFIG =================
 API_TOKEN = os.getenv("DERIV_API_TOKEN")
@@ -44,25 +43,25 @@ last_proposal_time = 0
 authorized = False
 
 ws = None
-lock = threading.Lock()
 
 # ================= LOG =================
 def log(msg):
     print(f"[{datetime.now(timezone.utc).isoformat()}] {msg}", flush=True)
 
 # ================= UTIL =================
-def ema(data, period):
-    if len(data) < period:
+def ema(arr, period):
+    if len(arr) < period:
         return None
-    w = np.exp(np.linspace(-1., 0., period))
+    arr = np.array(arr[-period:])
+    w = np.exp(np.linspace(-1, 0, period))
     w /= w.sum()
-    return np.convolve(data[-period:], w, mode="valid")[0]
+    return np.dot(arr, w)
 
 def compute_atr(prices):
     if len(prices) < ATR_PERIOD + 1:
         return 0.5
-    tr = [abs(prices[i] - prices[i-1]) for i in range(1, len(prices))]
-    return np.mean(tr[-ATR_PERIOD:])
+    diffs = np.abs(np.diff(prices))
+    return np.mean(diffs[-ATR_PERIOD:])
 
 # ================= SIGNALS =================
 def breakout_confidence():
@@ -85,15 +84,16 @@ def breakout_confidence():
 def ema_pullback(prices):
     if len(prices) < EMA_PULLBACK_SLOW:
         return None
-    df = pd.DataFrame({"c": prices})
-    df["ema14"] = df["c"].ewm(span=EMA_PULLBACK_FAST).mean()
-    df["ema200"] = df["c"].ewm(span=EMA_PULLBACK_SLOW).mean()
-    last, prev = df.iloc[-1], df.iloc[-2]
+
+    ema14 = ema(prices, EMA_PULLBACK_FAST)
+    ema200 = ema(prices, EMA_PULLBACK_SLOW)
+    prev_price = prices[-2]
+    last_price = prices[-1]
     atr = compute_atr(prices)
 
-    if last.c > last.ema200 and prev.c < prev.ema14 and last.c > last.ema14:
+    if last_price > ema200 and prev_price < ema14 and last_price > ema14:
         return "up", atr
-    if last.c < last.ema200 and prev.c > prev.ema14 and last.c < last.ema14:
+    if last_price < ema200 and prev_price > ema14 and last_price < ema14:
         return "down", atr
     return None
 
@@ -110,8 +110,8 @@ def evaluate():
     if conf < 0.5:
         return
 
-    ef = ema(list(tick_buffer), EMA_FAST)
-    es = ema(list(tick_buffer), EMA_SLOW)
+    ef = ema(tick_buffer, EMA_FAST)
+    es = ema(tick_buffer, EMA_SLOW)
     if ef is None or es is None:
         return
 
@@ -127,7 +127,6 @@ def evaluate():
     TRADE_AMOUNT = min(MAX_STAKE, BASE_STAKE + conf * BASE_STAKE)
     trade_queue.append((direction, 1, TRADE_AMOUNT))
     last_proposal_time = time.time()
-
     process_queue()
 
 def process_queue():
@@ -205,7 +204,7 @@ def start_ws():
 
 # ================= START =================
 if __name__ == "__main__":
-    log("🚀 EMA BREAKOUT BOT — KOYEB READY")
+    log("🚀 EMA BREAKOUT + PULLBACK BOT — KOYEB READY (NO pandas)")
     start_ws()
 
     while True:
