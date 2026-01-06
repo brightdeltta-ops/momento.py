@@ -1,281 +1,250 @@
-import websocket
-import json
-import threading
-import time
+import json, threading, time, websocket, os
 import numpy as np
-import os
 from collections import deque
 from datetime import datetime
 
-# ============================================================
-# CONFIG (Koyeb ENVIRONMENT VARIABLES)
-# ============================================================
+# ================================
+# KOYEB ENV CONFIG
+# ================================
 API_TOKEN = os.getenv("DERIV_API_TOKEN")
 APP_ID = int(os.getenv("APP_ID", "0"))
 SYMBOL = os.getenv("SYMBOL", "R_75")
 
 if not API_TOKEN or not APP_ID:
-    raise RuntimeError("Missing DERIV_API_TOKEN or APP_ID environment variables")
+    raise RuntimeError("Missing DERIV_API_TOKEN or APP_ID")
 
-# Trading parameters
-BASE_STAKE = 200.0
-MAX_STAKE = 240.0
-TRADE_RISK_FRAC = 0.02
-EMA_FAST_BASE = 6
-EMA_SLOW_BASE = 13
-EMA_CONF = 30
-MIN_TICKS = 15
-PROPOSAL_COOLDOWN = 0.2
-MIN_TRADE_INTERVAL = 4
-LOW_CONF_WAIT = 30  # idle seconds before low-confidence trade
-
-# ============================================================
-# STATE
-# ============================================================
-tick_history = deque(maxlen=300)
-equity_curve = []
-alerts = deque(maxlen=50)
-trade_queue = deque(maxlen=50)
-active_trades = []
-
-BALANCE = 1000.0
-WINS = 0
-LOSSES = 0
-TRADE_COUNT = 0
-
-trade_in_progress = False
-last_trade_time = 0
-last_proposal_time = 0
-TRADE_AMOUNT = BASE_STAKE
-next_trade_signal = None
-
-authorized = False
-ws_running = False
-ws = None
-lock = threading.Lock()
 DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
-# ============================================================
-# LOGGING / ALERTS
-# ============================================================
+# ================================
+# STRATEGY CONFIG
+# ================================
+BASE_STAKE = 1.0
+MAX_LOSS_MARTI = 5
+AUTO_LOT_STEP = 0.5
+TREND_STRENGTH_THRESHOLD = 0.6
+TICK_COOLDOWN_MIN = 1
+TICK_COOLDOWN_MAX = 4
+
+EMA_FAST, EMA_MEDIUM, EMA_SLOW = 4, 8, 16
+FRACTAL_WINDOW = 5
+MICRO_TICKS = 3
+
+# ================================
+# STATE
+# ================================
+tick_history = deque(maxlen=500)
+trade_memory = deque(maxlen=500)
+
+BALANCE = 0.0
+WINS = LOSSES = TRADES = 0
+
+ema_fast = ema_medium = ema_slow = 0.0
+martingale_level = 0
+trade_in_progress = False
+current_trade_amount = BASE_STAKE
+ticks_since_last_trade = 0
+
+ws = None
+lock = threading.Lock()
+
+# ================================
+# LOGGING
+# ================================
 def log(msg):
-    with lock:
-        alerts.appendleft(f"[{datetime.utcnow().isoformat()}] {msg}")
     print(f"[{datetime.utcnow().isoformat()}] {msg}", flush=True)
 
-def safe_ws_send(msg):
-    try:
-        if ws is not None:
-            ws.send(json.dumps(msg))
-    except Exception as e:
-        log(f"⚠ WS send error: {e}")
+# ================================
+# MATH UTILITIES
+# ================================
+def ema_update(prev, price, period):
+    alpha = 2 / (period + 1)
+    return price if prev == 0 else prev * (1 - alpha) + price * alpha
 
-# ============================================================
-# UTILITY FUNCTIONS
-# ============================================================
-def calculate_ema(data, period):
-    if len(data) < period:
+def detect_trend():
+    if ema_fast > ema_medium > ema_slow:
+        return "RISE"
+    if ema_fast < ema_medium < ema_slow:
+        return "FALL"
+    return None
+
+def detect_fractal():
+    if len(tick_history) < FRACTAL_WINDOW:
         return None
-    weights = np.exp(np.linspace(-1.,0.,period))
-    weights /= weights.sum()
-    return np.convolve(data[-period:], weights, mode='valid')[0]
+    arr = list(tick_history)[-FRACTAL_WINDOW:]
+    m = FRACTAL_WINDOW // 2
+    if arr[m] == max(arr): return "UP"
+    if arr[m] == min(arr): return "DOWN"
+    return None
 
-def quant_distribution_factor(window=30):
-    if len(tick_history) < window:
+def detect_strength():
+    if len(tick_history) < 20:
+        return 0
+    arr = np.array(list(tick_history)[-20:])
+    return min(abs(arr[-1] - arr[0]) / (np.std(arr) + 1e-8), 1)
+
+def compute_confidence():
+    slope = abs(ema_fast - ema_medium)
+    strength = detect_strength()
+    return min((slope / 0.1) * 0.5 + strength * 0.5, 1)
+
+def micro_predict(direction):
+    if len(tick_history) < MICRO_TICKS + 1:
+        return True
+    arr = np.array(list(tick_history)[-MICRO_TICKS-1:])
+    avg = np.mean(np.diff(arr))
+    return (direction == "RISE" and avg > 0) or (direction == "FALL" and avg < 0)
+
+# ================================
+# ADAPTIVE LEARNING
+# ================================
+ADAPTIVE_MIN_CONF = 0.6
+
+def dynamic_confidence(direction):
+    relevant = [t for t in trade_memory if t["dir"] == direction]
+    if not relevant:
         return 1.0
-    recent_ticks = np.array(list(tick_history)[-window:])
-    mean = np.mean(recent_ticks)
-    std = np.std(recent_ticks)
-    current = recent_ticks[-1]
-    z = (current - mean) / (std + 1e-8)
-    return np.clip(1.0 + np.tanh(z), 0.5, 2.0)
+    wins = sum(1 for t in relevant if t["res"] == "WIN")
+    return max(wins / len(relevant), ADAPTIVE_MIN_CONF)
 
-def quant_trend_strength(window=15):
-    if len(tick_history) < window:
-        return 0.0
-    recent = np.array(list(tick_history)[-window:])
-    x = np.arange(len(recent))
-    slope = np.polyfit(x, recent, 1)[0]
-    std = np.std(recent)
-    return slope / (std + 1e-8)
-
-def numeric_trade_grade():
-    if len(tick_history) < MIN_TICKS:
-        return 0.0
-    recent = np.array(list(tick_history)[-MIN_TICKS:])
-    ema_f = calculate_ema(recent, EMA_FAST_BASE)
-    ema_s = calculate_ema(recent, EMA_SLOW_BASE)
-    ema_c = calculate_ema(recent, EMA_CONF)
-    trend_score = quant_trend_strength()
-    ema_score = (ema_f - ema_s) / (np.mean(recent)+1e-8)
-    quant_factor = quant_distribution_factor()
-    momentum = (recent[-1] - recent[-2]) / (recent[-2]+1e-8)
-    grade = trend_score*0.45 + ema_score*0.3 + (quant_factor-1)*0.15 + momentum*0.1
-    recent_vol = np.std(recent)
-    dynamic_threshold = 0.02 * (1 + recent_vol*2)
-    return grade if abs(grade) > dynamic_threshold else 0.0
-
-def calculate_trade_amount(grade):
-    recent = np.array(list(tick_history)[-20:])
-    vol = np.std(recent)/np.mean(recent) if len(recent) >= 2 else 0.01
-    stake = BASE_STAKE*(0.05/max(vol,0.01))
-    stake = min(stake, MAX_STAKE, BALANCE*TRADE_RISK_FRAC)
-    stake *= quant_distribution_factor()
-    stake *= min(abs(grade)*3, 3.0)
-    return max(stake, BASE_STAKE)
-
-# ============================================================
+# ================================
 # TRADE LOGIC
-# ============================================================
-def evaluate_and_trade():
-    global last_proposal_time, TRADE_AMOUNT, last_trade_time
-    now = time.time()
-    if now - last_proposal_time < PROPOSAL_COOLDOWN:
+# ================================
+def fire_trade(direction):
+    global trade_in_progress
+    if trade_in_progress:
         return
-    if now - last_trade_time < MIN_TRADE_INTERVAL:
-        return
-    if len(tick_history) < MIN_TICKS:
-        return
-    grade = numeric_trade_grade()
-    direction = "RISE" if grade > 0 else "FALL"
-    if grade == 0 and now - last_trade_time > LOW_CONF_WAIT:
-        grade = 0.01
-        TRADE_AMOUNT = BASE_STAKE
-        log("⚡ Low-confidence fire mode triggered!")
-    if grade != 0:
-        TRADE_AMOUNT = calculate_trade_amount(grade)
-        trade_queue.append((direction, grade, TRADE_AMOUNT))
-        last_proposal_time = now
-        process_trade_queue()
-    else:
-        log("⚠ Skipping weak trade grade")
 
-def process_trade_queue():
-    global next_trade_signal
-    if trade_queue and not trade_in_progress:
-        direction, grade, stake = trade_queue.popleft()
-        next_trade_signal = direction
-        request_proposal(direction, grade, stake)
+    base = compute_confidence()
+    dyn = dynamic_confidence(direction)
 
-def request_proposal(direction, grade, stake):
-    global trade_in_progress, TRADE_AMOUNT, last_trade_time
-    ct = "CALL" if direction=="RISE" else "PUT"
-    proposal = {
+    if base < dyn:
+        log(f"⚠ Skip {direction} | base={base:.2f} dyn={dyn:.2f}")
+        return
+
+    trade_in_progress = True
+    payload = {
         "proposal": 1,
-        "amount": stake,
+        "amount": current_trade_amount,
         "basis": "stake",
-        "contract_type": ct,
+        "contract_type": "CALL" if direction == "RISE" else "PUT",
         "currency": "USD",
         "duration": 2,
         "duration_unit": "t",
         "symbol": SYMBOL
     }
-    trade_in_progress = True
-    last_trade_time = time.time()
-    log(f"📨 Proposal → {direction} | Stake {stake:.2f} | Grade {grade:.4f}")
-    safe_ws_send(proposal)
+    ws.send(json.dumps(payload))
+    log(f"🔥 Proposal {direction} | stake={current_trade_amount:.2f}")
 
-def on_contract_settlement(contract):
-    global BALANCE, WINS, LOSSES, TRADE_COUNT, trade_in_progress
-    profit = float(contract.get("profit") or 0)
-    BALANCE += profit
-    equity_curve.append(BALANCE)
-    if profit > 0: WINS += 1
-    else: LOSSES += 1
-    TRADE_COUNT += 1
-    trade_in_progress = False
-    log(f"✔ Settlement: {profit:.2f} | Next Stake {TRADE_AMOUNT:.2f}")
-    process_trade_queue()
+# ================================
+# ENGINE LOOP
+# ================================
+def engine():
+    global ema_fast, ema_medium, ema_slow, ticks_since_last_trade, trade_in_progress
 
-# ============================================================
-# WEBSOCKET HANDLER
-# ============================================================
-def on_message(ws_obj, msg):
-    global BALANCE, authorized
-    try:
-        data = json.loads(msg)
-        if "authorize" in data:
-            authorized = True
-            safe_ws_send({"ticks": SYMBOL, "subscribe": 1})
-            safe_ws_send({"balance": 1, "subscribe": 1})
-            safe_ws_send({"proposal_open_contract": 1, "subscribe": 1})
-            log("✔ Authorized")
-        if "tick" in data:
-            tick = float(data["tick"]["quote"])
-            tick_history.append(tick)
-            evaluate_and_trade()
-        if "balance" in data:
-            BALANCE = float(data["balance"]["balance"])
-            equity_curve.append(BALANCE)
-        if "proposal" in data:
-            pid = data["proposal"]["id"]
-            time.sleep(0.01)
-            safe_ws_send({"buy": pid, "price": TRADE_AMOUNT})
-            active_trades.append(pid)
-            log("✔ BUY sent")
-        if "proposal_open_contract" in data:
-            c = data["proposal_open_contract"]
-            if c.get("is_sold") or c.get("is_expired"):
-                on_contract_settlement(c)
-                active_trades[:] = [t for t in active_trades if t != c.get("id")]
-    except Exception as e:
-        log(f"⚠ WS Handler Error: {e}")
-
-# ============================================================
-# WEBSOCKET BOOT
-# ============================================================
-def start_ws():
-    global ws, ws_running
-    if ws_running: return
-    ws_running = True
-
-    def run_ws():
-        global ws
-        while True:
-            try:
-                ws = websocket.WebSocketApp(
-                    DERIV_WS,
-                    on_open=lambda ws_obj: safe_ws_send({"authorize": API_TOKEN}),
-                    on_message=on_message,
-                    on_error=lambda ws_obj, err: log(f"❌ WS Error: {err}"),
-                    on_close=lambda *args: log("❌ WS Closed")
-                )
-                ws.run_forever()
-            except Exception as e:
-                log(f"⚠ WS reconnect error: {e}")
-                time.sleep(2)
-    threading.Thread(target=run_ws, daemon=True).start()
-
-def keep_alive():
     while True:
-        time.sleep(15)
-        safe_ws_send({"ping": 1})
+        if len(tick_history) < EMA_SLOW:
+            time.sleep(0.05)
+            continue
 
-def auto_unfreeze():
-    global trade_in_progress, last_trade_time
-    while True:
-        time.sleep(1)
-        if trade_in_progress and time.time() - last_trade_time > 5:
+        price = tick_history[-1]
+        ema_fast = ema_update(ema_fast, price, EMA_FAST)
+        ema_medium = ema_update(ema_medium, price, EMA_MEDIUM)
+        ema_slow = ema_update(ema_slow, price, EMA_SLOW)
+
+        trend = detect_trend()
+        strength = detect_strength()
+        fractal = detect_fractal()
+
+        cooldown = int(TICK_COOLDOWN_MAX - strength * (TICK_COOLDOWN_MAX - TICK_COOLDOWN_MIN))
+        ticks_since_last_trade += 1
+
+        if (trend and strength >= TREND_STRENGTH_THRESHOLD
+            and ticks_since_last_trade >= cooldown
+            and confidence := compute_confidence() >= 0.65
+            and micro_predict(trend)
+            and not (trend == "RISE" and fractal == "DOWN")
+            and not (trend == "FALL" and fractal == "UP")):
+            fire_trade(trend)
+            ticks_since_last_trade = 0
+
+        if trade_in_progress and ticks_since_last_trade > 100:
             trade_in_progress = False
-            log("⚠ Auto-unfreeze: Trade reset")
-            process_trade_queue()
+            log("⚠ Trade timeout reset")
 
-# ============================================================
+        time.sleep(0.05)
+
+# ================================
+# WEBSOCKET HANDLER
+# ================================
+def on_message(_, msg):
+    global BALANCE, WINS, LOSSES, TRADES
+    global martingale_level, trade_in_progress, current_trade_amount
+
+    data = json.loads(msg)
+
+    if "authorize" in data:
+        ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
+        ws.send(json.dumps({"balance": 1, "subscribe": 1}))
+        ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
+        log("✔ Authorized")
+
+    if "tick" in data:
+        tick_history.append(float(data["tick"]["quote"]))
+
+    if "balance" in data:
+        BALANCE = float(data["balance"]["balance"])
+
+    if "proposal" in data:
+        ws.send(json.dumps({"buy": data["proposal"]["id"], "price": current_trade_amount}))
+
+    if "proposal_open_contract" in data:
+        c = data["proposal_open_contract"]
+        if c.get("is_sold"):
+            profit = float(c.get("profit", 0))
+            result = "WIN" if profit > 0 else "LOSS"
+            trade_memory.append({"dir": detect_trend(), "res": result})
+
+            if profit > 0:
+                WINS += 1
+                martingale_level = 0
+                current_trade_amount = BASE_STAKE + WINS * AUTO_LOT_STEP
+            else:
+                LOSSES += 1
+                martingale_level += 1
+                current_trade_amount = (
+                    BASE_STAKE * (2 ** martingale_level)
+                    if martingale_level <= MAX_LOSS_MARTI
+                    else BASE_STAKE
+                )
+
+            BALANCE += profit
+            TRADES += 1
+            trade_in_progress = False
+            log(f"✔ Settled {profit:.2f} | BAL {BALANCE:.2f}")
+
+# ================================
 # HEARTBEAT
-# ============================================================
+# ================================
 def heartbeat():
     while True:
         time.sleep(30)
         log("❤️ HEARTBEAT")
 
-# ============================================================
-# START BOT
-# ============================================================
+# ================================
+# START
+# ================================
 def start():
-    log("🚀 FIRE FIXED BOT — KOYEB READY (ENV COMPATIBLE)")
-    start_ws()
-    threading.Thread(target=keep_alive, daemon=True).start()
-    threading.Thread(target=auto_unfreeze, daemon=True).start()
+    global ws
+    log("🚀 FRACTAL EMA BOT — KOYEB READY")
+    ws = websocket.WebSocketApp(
+        DERIV_WS,
+        on_open=lambda w: w.send(json.dumps({"authorize": API_TOKEN})),
+        on_message=on_message,
+        on_error=lambda _, e: log(f"❌ WS error {e}"),
+        on_close=lambda *_: log("❌ WS closed")
+    )
+    threading.Thread(target=ws.run_forever, daemon=True).start()
+    threading.Thread(target=engine, daemon=True).start()
     threading.Thread(target=heartbeat, daemon=True).start()
     while True:
         time.sleep(5)
