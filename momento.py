@@ -1,13 +1,17 @@
-import json, threading, time, websocket, numpy as np, os
+import json, threading, time, websocket, numpy as np, os, pickle
 from collections import deque
-import pandas as pd
 from rich.console import Console
 from rich.table import Table
-from rich import box
+from rich.live import Live
+from datetime import datetime
 
-# ================= USER CONFIG =================
-API_TOKEN = os.getenv("API_TOKEN")  # Koyeb env var
+# ================= CONFIG =================
+API_TOKEN = os.getenv("DERIV_API_TOKEN")
 APP_ID = int(os.getenv("APP_ID", "112380"))
+
+if not API_TOKEN or not APP_ID:
+    raise RuntimeError("Missing DERIV_API_TOKEN or APP_ID")
+
 SYMBOL = "R_75"
 
 BASE_STAKE = 1.0
@@ -20,50 +24,37 @@ EMA_SLOW = 10
 MICRO_SLICE = 10
 MAX_DURATION = 12
 MIN_DURATION = 1
-COMPRESSION_BASE = 0.003
-MEAN_REVERT_ATR_MULT = 1.0
 ATR_PERIOD = 14
 EMA_REGIME_SLOW = 30
 EMA_PULLBACK_FAST = 14
 EMA_PULLBACK_SLOW = 50
+MEAN_REVERT_ATR_MULT = 1.0
 
-# ================= DATA TRACKING =================
+# ================= STATE =================
 tick_history = deque(maxlen=500)
 tick_buffer = deque(maxlen=MICRO_SLICE)
 trade_queue = deque(maxlen=30)
 active_trades = []
 
 BALANCE = 1000.0
+TRADE_AMOUNT = BASE_STAKE
 WINS = 0
 LOSSES = 0
 TRADE_COUNT = 0
-TRADE_AMOUNT = BASE_STAKE
 
 trade_in_progress = False
 last_trade_time = 0
 last_proposal_time = 0
-authorized = False
-ws_running = False
-ws = None
-lock = threading.Lock()
-DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+last_direction = None
 
+ws = None
+console = Console()
 alerts = deque(maxlen=50)
 equity_curve = []
 
-console = Console()
-
-# ================= Per-Regime Stats =================
-regime_stats = {
-    "Trending": {"wins":0,"losses":0,"profit":0,"trades":0,"streak":0},
-    "Ranging": {"wins":0,"losses":0,"profit":0,"trades":0,"streak":0},
-    "Spike": {"wins":0,"losses":0,"profit":0,"trades":0,"streak":0}
-}
-
 # ================= UTILITIES =================
 def append_alert(msg, color="white"):
-    with lock:
-        alerts.appendleft((msg, color))
+    alerts.appendleft((msg, color))
     console.log(f"[{color}]{msg}[/{color}]")
 
 def auto_unfreeze():
@@ -75,256 +66,172 @@ def auto_unfreeze():
             append_alert("⚠ Auto-unfreeze triggered", "yellow")
 
 def calculate_ema(data, period):
-    if len(data) < period:
-        return None
-    weights = np.exp(np.linspace(-1.,0.,period))
-    weights /= weights.sum()
-    return np.convolve(data[-period:], weights, mode="valid")[0]
+    if len(data) < period: return None
+    w = np.exp(np.linspace(-1.,0.,period))
+    w /= w.sum()
+    return np.convolve(data[-period:], w, mode="valid")[0]
 
 def compute_atr(prices, period=ATR_PERIOD):
-    if len(prices) < period+1:
-        return 0.001
+    if len(prices) < period+1: return 0.001
     tr = [abs(prices[i]-prices[i-1]) for i in range(1,len(prices))]
     return np.mean(tr[-period:])
 
-def session_loss_check():
-    return LOSSES*BASE_STAKE < 50
-
-# ================= REGIME DETECTION =================
 def detect_regime():
-    if len(tick_history) < EMA_REGIME_SLOW:
-        return "Ranging"
+    if len(tick_history) < EMA_REGIME_SLOW: return "Ranging"
     atr = compute_atr(list(tick_history))
     slow_ema = calculate_ema(list(tick_history), EMA_REGIME_SLOW)
-    prev_slow_ema = calculate_ema(list(tick_history)[:-1], EMA_REGIME_SLOW)
-    if slow_ema is None or prev_slow_ema is None:
-        return "Ranging"
-
-    slope = slow_ema - prev_slow_ema
-    if abs(slope) > atr*0.1:
-        return "Trending"
-    if atr > 0.0025:
-        return "Spike"
+    prev_ema = calculate_ema(list(tick_history)[:-1], EMA_REGIME_SLOW)
+    if slow_ema is None or prev_ema is None: return "Ranging"
+    slope = slow_ema - prev_ema
+    if abs(slope) > atr*0.1: return "Trending"
+    if atr > 0.0025: return "Spike"
     return "Ranging"
 
 # ================= SIGNALS =================
 def ema_pullback_signal(prices):
-    if len(prices) < EMA_PULLBACK_SLOW:
-        return None
+    if len(prices) < EMA_PULLBACK_SLOW: return None
     df = pd.DataFrame({"Close": prices})
     df["EMA14"] = df["Close"].ewm(span=EMA_PULLBACK_FAST, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=EMA_PULLBACK_SLOW, adjust=False).mean()
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    last, prev = df.iloc[-1], df.iloc[-2]
     atr = compute_atr(prices)
     if last["Close"] > df["EMA50"].iloc[-1] and prev["Close"] < df["EMA14"].iloc[-2] and last["Close"] > df["EMA14"].iloc[-1]:
-        return "up", last["Close"] - atr, last["Close"] + 2*atr
-    elif last["Close"] < df["EMA50"].iloc[-1] and prev["Close"] > df["EMA14"].iloc[-2] and last["Close"] < df["EMA14"].iloc[-1]:
-        return "down", last["Close"] + atr, last["Close"] - 2*atr
+        return "up"
+    if last["Close"] < df["EMA50"].iloc[-1] and prev["Close"] > df["EMA14"].iloc[-2] and last["Close"] < df["EMA14"].iloc[-1]:
+        return "down"
+    return None
+
+def get_mean_reversion():
+    if len(tick_history) < 14: return None
+    last = tick_history[-1]
+    ema14 = calculate_ema(list(tick_history), 14)
+    atr = compute_atr(list(tick_history))
+    if last > ema14 + MEAN_REVERT_ATR_MULT*atr: return "down"
+    if last < ema14 - MEAN_REVERT_ATR_MULT*atr: return "up"
     return None
 
 def get_compression_breakout():
-    if len(tick_buffer) < MICRO_SLICE:
-        return None,0
-    recent = np.array(tick_buffer)
-    rng = recent.max() - recent.min()
-    dynamic_thresh = COMPRESSION_BASE * (1 + compute_atr(list(tick_history))*50)
-    if rng < dynamic_thresh:
-        current = recent[-1]
-        direction = None
-        if current > recent.max(): direction="up"
-        elif current < recent.min(): direction="down"
-        confidence = min(1, rng*200+0.2) if direction else 0
-        return direction, confidence
-    return None,0
+    if len(tick_buffer) < MICRO_SLICE: return None
+    arr = np.array(tick_buffer)
+    rng = arr.max() - arr.min()
+    threshold = 0.003 * (1 + compute_atr(list(tick_history))*50)
+    if rng < threshold:
+        current = arr[-1]
+        if current > arr.max(): return "up"
+        if current < arr.min(): return "down"
+    return None
 
-def get_mean_reversion():
-    if len(tick_history) < 14:
-        return None,0
-    last_price = tick_history[-1]
-    ema14 = calculate_ema(list(tick_history), 14)
-    atr = compute_atr(list(tick_history))
-    if ema14 is None: return None,0
-    if last_price > ema14 + MEAN_REVERT_ATR_MULT*atr:
-        return "down", 0.6
-    elif last_price < ema14 - MEAN_REVERT_ATR_MULT*atr:
-        return "up", 0.6
-    return None,0
+def dynamic_stake(conf):
+    stake = BASE_STAKE + conf * BALANCE * TRADE_RISK_FRAC
+    return min(max(stake, BASE_STAKE), MAX_STAKE)
 
-def get_dynamic_sl_tp(direction, price, atr, regime):
-    if regime=="Trending":
-        sl = price - atr if direction=="up" else price + atr
-        tp = price + 2*atr if direction=="up" else price - 2*atr
-    elif regime=="Ranging":
-        sl = price - 0.5*atr if direction=="up" else price + 0.5*atr
-        tp = price + atr if direction=="up" else price - atr
-    else:
-        sl = price - atr if direction=="up" else price + atr
-        tp = price + 1.5*atr if direction=="up" else price - 1.5*atr
-    return sl,tp
-
-# ================= TRADE EXECUTION =================
+# ================= TRADING =================
 def evaluate_and_trade():
-    global last_proposal_time, TRADE_AMOUNT
-    if time.time() - last_proposal_time < PROPOSAL_COOLDOWN:
-        return
-    if not session_loss_check():
-        return
-
+    global last_proposal_time, TRADE_AMOUNT, last_direction
+    if trade_in_progress: return
+    if time.time() - last_proposal_time < PROPOSAL_COOLDOWN: return
     regime = detect_regime()
-    direction, confidence, signal_color = None, 0, "white"
+    direction = None
+    if regime == "Trending": direction = get_compression_breakout() or ema_pullback_signal(list(tick_history))
+    if regime == "Ranging": direction = get_mean_reversion() or get_compression_breakout()
+    if regime == "Spike": direction = get_compression_breakout()
+    if not direction: return
 
-    # Regime-specific signals
-    if regime == "Trending":
-        direction, confidence = get_compression_breakout()
-        if direction: signal_color = "green" if direction=="up" else "red"
-        elif ema_pullback_signal(list(tick_history)):
-            direction, sl, tp = ema_pullback_signal(list(tick_history))
-            signal_color = "cyan"
-    elif regime == "Ranging":
-        direction, confidence = get_mean_reversion()
-        signal_color = "yellow" if direction else "white"
-        if not direction:
-            direction, confidence = get_compression_breakout()
-            if direction: signal_color = "green" if direction=="up" else "red"
-    elif regime == "Spike":
-        direction, confidence = get_compression_breakout()
-        if direction: signal_color = "green" if direction=="up" else "red"
+    TRADE_AMOUNT = dynamic_stake(0.5)
+    duration = MAX_DURATION
+    trade_queue.append((direction, duration, TRADE_AMOUNT))
+    last_direction = direction
+    last_proposal_time = time.time()
+    process_queue()
 
-    if direction:
-        if regime=="Trending": TRADE_AMOUNT = min(MAX_STAKE, BASE_STAKE + confidence*BASE_STAKE*2)
-        elif regime=="Spike": TRADE_AMOUNT = min(MAX_STAKE, BASE_STAKE + confidence*BASE_STAKE*1.5)
-        else: TRADE_AMOUNT = BASE_STAKE
-
-        duration = max(MIN_DURATION, int((1-confidence)*MAX_DURATION))
-        trade_queue.append((direction, duration, TRADE_AMOUNT, regime, signal_color))
-        last_proposal_time = time.time()
-        append_alert(f"🚀 Queued {direction.upper()} | Stake {TRADE_AMOUNT:.2f} | Dur {duration} | Conf {confidence:.2f} | Regime {regime}", signal_color)
-        process_trade_queue()
-
-def process_trade_queue():
+def process_queue():
     global trade_in_progress
     if trade_queue and not trade_in_progress:
-        sig = trade_queue.popleft()
-        request_proposal(sig)
+        d, dur, s = trade_queue.popleft()
+        send_proposal(d, dur, s)
 
-def request_proposal(sig):
-    global TRADE_AMOUNT, trade_in_progress, last_trade_time
-    direction,duration,stake,regime,color = sig
-    TRADE_AMOUNT = stake
-    ct = "CALL" if direction=="up" else "PUT"
-    proposal = {
+def send_proposal(d, dur, s):
+    global trade_in_progress
+    ct = "CALL" if d=="up" else "PUT"
+    ws.send(json.dumps({
         "proposal":1,
-        "amount":TRADE_AMOUNT,
+        "amount":s,
         "basis":"stake",
         "contract_type":ct,
         "currency":"USD",
-        "duration":duration,
+        "duration":dur,
         "duration_unit":"t",
         "symbol":SYMBOL
-    }
+    }))
+    append_alert(f"📨 Proposal sent {ct} | Stake {s:.2f}", "magenta")
     trade_in_progress = True
-    last_trade_time = time.time()
-    ws.send(json.dumps(proposal))
-    append_alert(f"📨 Proposal sent {direction.upper()} | Stake {TRADE_AMOUNT:.2f} | Dur {duration} | Regime {regime}", color)
 
-def on_contract_settlement(c, regime):
-    global BALANCE,WINS,LOSSES,TRADE_COUNT,trade_in_progress
-    profit = float(c.get("profit") or 0)
+def settle(c):
+    global BALANCE, WINS, LOSSES, TRADE_COUNT, trade_in_progress
+    profit = float(c.get("profit",0))
     BALANCE += profit
-    equity_curve.append(BALANCE)
     TRADE_COUNT += 1
     trade_in_progress = False
-
-    stats = regime_stats[regime]
-    stats["trades"] += 1
-    stats["profit"] += profit
-    if profit>0:
-        WINS += 1
-        stats["wins"] += 1
-        stats["streak"] += 1
-    else:
-        LOSSES += 1
-        stats["losses"] += 1
-        stats["streak"] = 0
-
-    append_alert(f"✔ Settlement → Profit {profit:.2f} | Regime {regime}", "green")
-    process_trade_queue()
+    if profit>0: WINS+=1
+    else: LOSSES+=1
+    append_alert(f"✔ Settled {last_direction} | Profit {profit:.2f}", "green" if profit>0 else "red")
 
 # ================= WEBSOCKET =================
-def on_message(ws,msg):
-    global BALANCE,authorized
-    try:
-        data=json.loads(msg)
-        if "authorize" in data:
-            authorized=True
-            resubscribe_channels()
-            append_alert("✔ Authorized", "green")
-        if "tick" in data:
-            tick=float(data["tick"]["quote"])
-            tick_history.append(tick)
-            tick_buffer.append(tick)
-            evaluate_and_trade()
-        if "proposal" in data:
-            pid=data["proposal"]["id"]
-            time.sleep(PROPOSAL_DELAY)
-            ws.send(json.dumps({"buy":pid,"price":TRADE_AMOUNT}))
-            active_trades.append({"id":pid,"profit":0})
-        if "proposal_open_contract" in data:
-            c=data["proposal_open_contract"]
-            if c.get("is_sold") or c.get("is_expired"):
-                regime = detect_regime()
-                on_contract_settlement(c, regime)
-                active_trades[:] = [t for t in active_trades if t["id"]!=c.get("id")]
-        if "balance" in data:
-            BALANCE=float(data["balance"]["balance"])
-            equity_curve.append(BALANCE)
-    except Exception as e:
-        append_alert(f"❌ WS Error: {e}", "red")
-
-def resubscribe_channels():
-    if not authorized: return
+def resubscribe():
     ws.send(json.dumps({"ticks":SYMBOL,"subscribe":1}))
     ws.send(json.dumps({"balance":1,"subscribe":1}))
     ws.send(json.dumps({"proposal_open_contract":1,"subscribe":1}))
-    append_alert("🔄 Resubscribed channels", "green")
-
-def on_error(ws,error):
-    append_alert(f"❌ WS Error: {error}", "red")
-
-def on_close(ws,code,msg):
-    append_alert("❌ WS Closed — reconnecting in 2s", "yellow")
-    time.sleep(2)
-    start_ws()
 
 def start_ws():
-    global ws, ws_running, authorized
-    if ws_running: return
-    ws_running=True
-    authorized=False
-    ws=websocket.WebSocketApp(
-        DERIV_WS,
-        on_open=lambda ws: ws.send(json.dumps({"authorize":API_TOKEN})),
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close
-    )
+    global ws
+    url = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+
+    def on_open(w): w.send(json.dumps({"authorize":API_TOKEN}))
+    def on_message(w,msg):
+        try:
+            data = json.loads(msg)
+            if "authorize" in data: resub()
+            if "tick" in data:
+                t = float(data["tick"]["quote"])
+                tick_history.append(t)
+                tick_buffer.append(t)
+                append_alert(f"💠 Tick {t:.4f}", "cyan")
+                evaluate_and_trade()
+            if "proposal" in data:
+                time.sleep(PROPOSAL_DELAY)
+                w.send(json.dumps({"buy":data["proposal"]["id"],"price":TRADE_AMOUNT}))
+            if "proposal_open_contract" in data:
+                c = data["proposal_open_contract"]
+                if c.get("is_sold") or c.get("is_expired"): settle(c)
+            if "balance" in data:
+                global BALANCE
+                BALANCE = float(data["balance"]["balance"])
+        except Exception as e:
+            append_alert(f"❌ WS Error {e}", "red")
+
+    ws = websocket.WebSocketApp(url,on_open=on_open,on_message=on_message)
     threading.Thread(target=ws.run_forever,daemon=True).start()
 
-def keep_alive():
-    while True:
-        time.sleep(15)
-        try: ws.send(json.dumps({"ping":1}))
-        except: pass
+# ================= DASHBOARD =================
+def dashboard():
+    with Live(refresh_per_second=1) as live:
+        last_trade = -1
+        while True:
+            t = Table(title="🚀 ALPHA BOT — Koyeb Ready", box=None)
+            t.add_column("Metric")
+            t.add_column("Value")
+            t.add_row("Balance", f"{BALANCE:.2f}")
+            t.add_row("Trades", str(TRADE_COUNT))
+            t.add_row("Wins", str(WINS))
+            t.add_row("Losses", str(LOSSES))
+            t.add_row("Open Trades", str(len(trade_queue)))
+            live.update(t)
+            time.sleep(1)
 
 # ================= START =================
-def start():
-    append_alert("🚀 Alpha Bot starting...", "cyan")
-    start_ws()
-    threading.Thread(target=keep_alive,daemon=True).start()
-    threading.Thread(target=auto_unfreeze,daemon=True).start()
-    while True:
-        time.sleep(1)
-
 if __name__=="__main__":
-    start()
+    append_alert("🚀 ALPHA BOT STARTED — Koyeb Compatible", "green")
+    start_ws()
+    threading.Thread(target=dashboard,daemon=True).start()
+    threading.Thread(target=auto_unfreeze,daemon=True).start()
+    while True: time.sleep(5)
