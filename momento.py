@@ -18,8 +18,8 @@ if not API_TOKEN or not APP_ID:
     raise RuntimeError("Missing DERIV_API_TOKEN or APP_ID environment variables")
 
 # Trading parameters
-BASE_STAKE = 1.0
-MAX_STAKE = 100.0
+BASE_STAKE = 200.0
+MAX_STAKE = 240.0
 TRADE_RISK_FRAC = 0.02
 EMA_FAST_BASE = 6
 EMA_SLOW_BASE = 13
