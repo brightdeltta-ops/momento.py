@@ -6,7 +6,7 @@ from rich.live import Live
 from rich.text import Text
 from datetime import datetime
 
-# ================= CONFIG (AGGRESSIVE MODE) =================
+# ================= CONFIG =================
 API_TOKEN = os.getenv("DERIV_API_TOKEN")
 APP_ID = int(os.getenv("APP_ID", "0"))
 
@@ -17,22 +17,21 @@ SYMBOL = "R_75"
 BASE_STAKE = 1.0
 MAX_STAKE = 200.0
 TRADE_RISK_FRAC = 0.05
-
 PROPOSAL_COOLDOWN = 2
 PROPOSAL_DELAY = 6
-
 EMA_FAST = 3
 EMA_SLOW = 10
 MICRO_SLICE = 10
-
 VOLATILITY_WINDOW = 15
-MAX_DD = 0.25
+MAX_DD = 0.15
+MIN_SHARPE = 0.2
 
 # ================= STATE =================
 tick_history = deque(maxlen=500)
 tick_buffer = deque(maxlen=MICRO_SLICE)
 trade_queue = deque(maxlen=50)
 trade_log = deque(maxlen=10)
+ROLLING_PNL = deque(maxlen=50)
 
 BALANCE = 0.0
 MAX_BALANCE = 0.0
@@ -45,11 +44,13 @@ last_proposal_time = 0
 last_direction = None
 stop_bot = False
 
+WIN_STREAK = 0
+LOSS_STREAK = 0
+
 ws = None
-lock = threading.Lock()
 console = Console()
 
-# ================= ALPHA ONLINE LEARNER =================
+# ================= ALPHA LEARNER =================
 class AlphaLearner:
     def __init__(self, n_features):
         self.weights = np.zeros(n_features)
@@ -110,11 +111,25 @@ def adaptive_volatility_threshold():
     recent_std = np.std(list(tick_history)[-VOLATILITY_WINDOW:])
     return max(0.0003, recent_std * 0.7)
 
-def calculate_dynamic_stake(confidence):
-    edge_factor = confidence
-    dd_factor = max(0.3, 1 - ((MAX_BALANCE - BALANCE) / (MAX_BALANCE + 1e-6)))
-    stake = BASE_STAKE + edge_factor * TRADE_RISK_FRAC * BALANCE * dd_factor
-    return min(stake, MAX_STAKE)
+def rolling_sharpe():
+    if not ROLLING_PNL:
+        return 0.0
+    pnl_array = np.array(ROLLING_PNL)
+    return pnl_array.mean() / (pnl_array.std() + 1e-6)
+
+def calculate_streak_multiplier():
+    multiplier = 1.0
+    if WIN_STREAK >= 2:
+        multiplier += 0.2
+    elif LOSS_STREAK >= 2:
+        multiplier -= 0.3
+    return max(0.5, multiplier)
+
+def calculate_dynamic_stake_ultra(confidence):
+    base = BASE_STAKE + confidence * TRADE_RISK_FRAC * BALANCE * max(0.3, 1 - ((MAX_BALANCE - BALANCE) / (MAX_BALANCE + 1e-6)))
+    streak_mult = calculate_streak_multiplier()
+    sharpe_mult = 1.0 if rolling_sharpe() >= MIN_SHARPE else 0.5
+    return min(base * streak_mult * sharpe_mult, MAX_STAKE)
 
 def record_trade_log(direction, stake, confidence, profit):
     trade_log.appendleft({
@@ -147,9 +162,8 @@ def log_heartbeat():
     console.log(f"[blue][{ts}] ❤️ HEARTBEAT: Bot running, no new trades[/blue]")
 
 # ================= TRADING =================
-def evaluate_and_trade():
+def evaluate_and_trade_ultra():
     global last_proposal_time, TRADE_AMOUNT, last_direction
-
     if stop_bot or time.time() - last_proposal_time < PROPOSAL_COOLDOWN:
         return
     if not session_loss_check() or len(tick_history) < VOLATILITY_WINDOW:
@@ -163,18 +177,20 @@ def evaluate_and_trade():
 
     direction_num, confidence = learner.predict(features)
     direction = "up" if direction_num == 1 else "down"
-    TRADE_AMOUNT = calculate_dynamic_stake(confidence)
-
-    trade_queue.append((direction, 1, TRADE_AMOUNT))
+    TRADE_AMOUNT = calculate_dynamic_stake_ultra(confidence)
+    trade_queue.append((confidence, direction, 1, TRADE_AMOUNT))
     last_proposal_time = time.time()
     last_direction = direction
+    process_trade_queue_priority()
 
-    process_trade_queue()
-
-def process_trade_queue():
+def process_trade_queue_priority():
     global trade_in_progress
     if trade_queue and not trade_in_progress:
-        direction, duration, stake = trade_queue.popleft()
+        sorted_queue = sorted(trade_queue, key=lambda x: -x[0])
+        _, direction, duration, stake = sorted_queue.pop(0)
+        trade_queue.clear()
+        for t in sorted_queue:
+            trade_queue.append(t)
         send_proposal(direction, duration, stake)
 
 def send_proposal(direction, duration, stake):
@@ -193,8 +209,9 @@ def send_proposal(direction, duration, stake):
     log_proposal(ct, stake)
     trade_in_progress = True
 
-def on_contract_settlement(c):
+def on_contract_settlement_ultra(c):
     global BALANCE, WINS, LOSSES, TRADE_COUNT, trade_in_progress, MAX_BALANCE
+    global WIN_STREAK, LOSS_STREAK
     profit = float(c.get("profit") or 0)
     BALANCE += profit
     MAX_BALANCE = max(MAX_BALANCE, BALANCE)
@@ -203,6 +220,16 @@ def on_contract_settlement(c):
     TRADE_COUNT += 1
     trade_in_progress = False
     record_trade_log(last_direction or "N/A", TRADE_AMOUNT, 0.7, profit)
+
+    # Update streaks
+    if profit > 0:
+        WIN_STREAK += 1
+        LOSS_STREAK = 0
+    else:
+        LOSS_STREAK += 1
+        WIN_STREAK = 0
+
+    ROLLING_PNL.append(profit)
     log_trade(last_direction or "N/A", TRADE_AMOUNT, profit)
 
     features = extract_features()
@@ -239,14 +266,14 @@ def start_ws():
                 tick_history.append(tick)
                 tick_buffer.append(tick)
                 log_tick(tick)
-                evaluate_and_trade()
+                evaluate_and_trade_ultra()
             if "proposal" in data:
                 time.sleep(PROPOSAL_DELAY)
                 ws.send(json.dumps({"buy": data["proposal"]["id"], "price": TRADE_AMOUNT}))
             if "proposal_open_contract" in data:
                 c = data["proposal_open_contract"]
                 if c.get("is_sold") or c.get("is_expired"):
-                    on_contract_settlement(c)
+                    on_contract_settlement_ultra(c)
             if "balance" in data:
                 global BALANCE
                 BALANCE = float(data["balance"]["balance"])
@@ -274,7 +301,7 @@ def dashboard_loop():
     with Live(auto_refresh=True, refresh_per_second=1) as live:
         last_trade_count = -1
         while True:
-            table = Table(title="🚀 Momento Bot Dashboard [NEXT-GEN ALPHA]")
+            table = Table(title="🚀 Momento Bot Dashboard [ULTRA-ALPHA]")
             table.add_column("Metric", justify="left")
             table.add_column("Value", justify="right")
 
@@ -284,6 +311,9 @@ def dashboard_loop():
             table.add_row("Wins", str(WINS))
             table.add_row("Losses", str(LOSSES))
             table.add_row("Learner Accuracy", f"{learner.rolling_accuracy()*100:.1f}%")
+            table.add_row("Rolling Sharpe", f"{rolling_sharpe():.2f}")
+            table.add_row("Win Streak", str(WIN_STREAK))
+            table.add_row("Loss Streak", str(LOSS_STREAK))
 
             if TRADE_COUNT == last_trade_count:
                 log_heartbeat()
@@ -320,7 +350,7 @@ def dashboard_loop():
 
 # ================= START =================
 if __name__ == "__main__":
-    console.print("[green]🚀 Momento Bot starting on Koyeb [NEXT-GEN ALPHA][/green]")
+    console.print("[green]🚀 Momento Bot starting on Koyeb [ULTRA-ALPHA][/green]")
     start_ws()
     threading.Thread(target=dashboard_loop, daemon=True).start()
     while True:
