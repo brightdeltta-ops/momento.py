@@ -1,9 +1,8 @@
-import json, threading, time, websocket, numpy as np, os, pickle
+import json, threading, time, websocket, numpy as np, os, pandas as pd
 from collections import deque
 from rich.console import Console
 from rich.table import Table
 from rich.live import Live
-from datetime import datetime
 
 # ================= CONFIG =================
 API_TOKEN = os.getenv("DERIV_API_TOKEN")
@@ -13,7 +12,6 @@ if not API_TOKEN or not APP_ID:
     raise RuntimeError("Missing DERIV_API_TOKEN or APP_ID")
 
 SYMBOL = "R_75"
-
 BASE_STAKE = 1.0
 MAX_STAKE = 100.0
 TRADE_RISK_FRAC = 0.02
@@ -178,46 +176,56 @@ def settle(c):
 
 # ================= WEBSOCKET =================
 def resubscribe():
-    ws.send(json.dumps({"ticks":SYMBOL,"subscribe":1}))
-    ws.send(json.dumps({"balance":1,"subscribe":1}))
-    ws.send(json.dumps({"proposal_open_contract":1,"subscribe":1}))
+    """Subscribe to required channels"""
+    if ws is None: return
+    ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
+    ws.send(json.dumps({"balance": 1, "subscribe": 1}))
+    ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
+    append_alert("🔄 Resubscribed channels", "green")
 
 def start_ws():
     global ws
     url = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
-    def on_open(w): w.send(json.dumps({"authorize":API_TOKEN}))
-    def on_message(w,msg):
+    def on_open(w): 
+        w.send(json.dumps({"authorize": API_TOKEN}))
+
+    def on_message(w, msg):
         try:
             data = json.loads(msg)
-            if "authorize" in data: resub()
+            if "authorize" in data and not data["authorize"].get("error"):
+                resubscribe()
+
             if "tick" in data:
                 t = float(data["tick"]["quote"])
                 tick_history.append(t)
                 tick_buffer.append(t)
                 append_alert(f"💠 Tick {t:.4f}", "cyan")
                 evaluate_and_trade()
+
             if "proposal" in data:
                 time.sleep(PROPOSAL_DELAY)
-                w.send(json.dumps({"buy":data["proposal"]["id"],"price":TRADE_AMOUNT}))
+                w.send(json.dumps({"buy": data["proposal"]["id"], "price": TRADE_AMOUNT}))
+
             if "proposal_open_contract" in data:
                 c = data["proposal_open_contract"]
-                if c.get("is_sold") or c.get("is_expired"): settle(c)
+                if c.get("is_sold") or c.get("is_expired"): 
+                    settle(c)
+
             if "balance" in data:
                 global BALANCE
                 BALANCE = float(data["balance"]["balance"])
         except Exception as e:
             append_alert(f"❌ WS Error {e}", "red")
 
-    ws = websocket.WebSocketApp(url,on_open=on_open,on_message=on_message)
-    threading.Thread(target=ws.run_forever,daemon=True).start()
+    ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_message)
+    threading.Thread(target=ws.run_forever, daemon=True).start()
 
 # ================= DASHBOARD =================
 def dashboard():
     with Live(refresh_per_second=1) as live:
-        last_trade = -1
         while True:
-            t = Table(title="🚀 ALPHA BOT — Koyeb Ready", box=None)
+            t = Table(title="🚀 ALPHA BOT — Koyeb Ready")
             t.add_column("Metric")
             t.add_column("Value")
             t.add_row("Balance", f"{BALANCE:.2f}")
@@ -232,6 +240,6 @@ def dashboard():
 if __name__=="__main__":
     append_alert("🚀 ALPHA BOT STARTED — Koyeb Compatible", "green")
     start_ws()
-    threading.Thread(target=dashboard,daemon=True).start()
-    threading.Thread(target=auto_unfreeze,daemon=True).start()
+    threading.Thread(target=dashboard, daemon=True).start()
+    threading.Thread(target=auto_unfreeze, daemon=True).start()
     while True: time.sleep(5)
