@@ -1,3 +1,5 @@
+# ================= ALPHA-UPGRADED MOMENTO BOT CORE =================
+
 import json, threading, time, websocket, numpy as np, os
 from collections import deque
 from rich.console import Console
@@ -10,283 +12,262 @@ from datetime import datetime
 API_TOKEN = os.getenv("DERIV_API_TOKEN")
 APP_ID = int(os.getenv("APP_ID", "0"))
 
-if not API_TOKEN or not APP_ID:
-    raise RuntimeError("Missing DERIV_API_TOKEN or APP_ID")
-
 SYMBOL = "R_75"
-
 BASE_STAKE = 1.0
 MAX_STAKE = 200.0
 TRADE_RISK_FRAC = 0.05
-
+PROPOSAL_COOLDOWN = 2
+PROPOSAL_DELAY = 6
 EMA_FAST = 3
 EMA_SLOW = 10
 MICRO_SLICE = 10
 VOLATILITY_WINDOW = 15
 VOLATILITY_THRESHOLD = 0.0005
-
-PROPOSAL_COOLDOWN = 2
-PROPOSAL_DELAY = 6
+MAX_DD = 0.25
 
 # ================= STATE =================
 tick_history = deque(maxlen=500)
 tick_buffer = deque(maxlen=MICRO_SLICE)
-trade_queue = deque(maxlen=10)
+trade_queue = deque(maxlen=50)
 trade_log = deque(maxlen=10)
 
 BALANCE = 0.0
 MAX_BALANCE = 0.0
+WINS = 0
+LOSSES = 0
+TRADE_COUNT = 0
 TRADE_AMOUNT = BASE_STAKE
-WINS = LOSSES = TRADE_COUNT = 0
-
 trade_in_progress = False
 last_proposal_time = 0
 last_direction = None
+stop_bot = False
 
-lock = threading.Lock()
 ws = None
+lock = threading.Lock()
 console = Console()
 
-# ================= EQUITY SYSTEMS =================
-EQUITY_LOCK = 0.0
-EQUITY_STEP = 50.0
-LOCK_TOLERANCE = 0.03
-
-SESSION_START_BALANCE = 0.0
-SESSION_LOCK = 0.0
-SESSION_LOCK_PCT = 0.02
-
-PROFIT_VAULT = 0.0
-VAULT_STEP = 100.0
-
-PAUSE_TRADING = False
-HARD_LOCK = False
-
-# ================= LEARNER =================
+# ================= ALPHA LEARNER =================
 class OnlineLearner:
-    def __init__(self, n):
-        self.w = np.zeros(n)
-        self.b = 0.0
-        self.lr = 0.05
-        self.decay = 0.999
-
-    def margin(self, x):
-        return np.dot(self.w, x) + self.b
+    def __init__(self, n_features):
+        self.weights = np.zeros(n_features)
+        self.bias = 0.0
+        self.lr = 0.1
+        self.signal_history = deque(maxlen=50)
 
     def predict(self, x):
-        return 1 if self.margin(x) > 0 else -1
-
-    def confidence(self, x):
-        return min(1.0, abs(self.margin(x)) / (np.linalg.norm(self.w) + 1e-6))
+        raw = np.dot(self.weights, x) + self.bias
+        confidence = 1 / (1 + np.exp(-raw))  # sigmoid 0-1
+        direction = 1 if raw > 0 else -1
+        return direction, confidence
 
     def update(self, x, profit):
         y = 1 if profit > 0 else -1
-        err = y - self.predict(x)
-        self.w *= self.decay
-        conf = self.confidence(x)
-        self.w += self.lr * err * conf * x
-        self.b += self.lr * err * conf
+        pred, _ = self.predict(x)
+        error = y - pred
+        self.weights += self.lr * error * x
+        self.bias += self.lr * error
+        self.signal_history.append((pred, profit))
 
-learner = OnlineLearner(4)
+    def confidence_adjusted(self):
+        if not self.signal_history:
+            return 0.5
+        wins = sum(1 for d, p in self.signal_history if d == 1 and p > 0)
+        total = len(self.signal_history)
+        return max(0.2, min(0.9, wins / total))
+
+learner = OnlineLearner(n_features=7)
 
 # ================= UTILITIES =================
 def calculate_ema(data, period):
     if len(data) < period:
         return None
-    w = np.exp(np.linspace(-1, 0, period))
-    w /= w.sum()
-    return np.convolve(data[-period:], w, mode="valid")[0]
+    weights = np.exp(np.linspace(-1., 0., period))
+    weights /= weights.sum()
+    return np.convolve(data[-period:], weights, mode="valid")[0]
+
+def session_loss_check():
+    if MAX_BALANCE == 0:
+        return True
+    return (MAX_BALANCE - BALANCE) < (MAX_BALANCE * MAX_DD)
 
 def extract_features():
     if len(tick_buffer) < MICRO_SLICE:
         return None
-    a = np.array(tick_buffer)
-    ef = calculate_ema(a, EMA_FAST)
-    es = calculate_ema(a, EMA_SLOW)
-    if ef is None or es is None:
+    arr = np.array(tick_buffer)
+    ema_fast = calculate_ema(arr, EMA_FAST)
+    ema_slow = calculate_ema(arr, EMA_SLOW)
+    if ema_fast is None or ema_slow is None:
         return None
-    return np.array([
-        ef - es,
-        a[-1] - a.mean(),
-        a.std(),
-        (a[-1] - a[0]) / (a.std() + 1e-6)
+    features = np.array([
+        ema_fast,
+        ema_slow,
+        arr[-1] - arr[0],
+        arr.std(),
+        arr[-1] - np.mean(arr),
+        arr[-1] - arr[-2],
+        ema_fast - ema_slow
     ])
+    return features
 
-def tradable_market():
-    if len(tick_history) < VOLATILITY_WINDOW:
-        return False
-    r = np.array(list(tick_history)[-VOLATILITY_WINDOW:])
-    return r.std() > VOLATILITY_THRESHOLD and abs(r[-1] - r[0]) > r.std()
+def calculate_dynamic_stake(confidence_adjusted):
+    stake = BASE_STAKE + confidence_adjusted * BALANCE * TRADE_RISK_FRAC
+    return min(stake, MAX_STAKE)
 
-def regime_strength():
-    r = np.array(list(tick_history)[-VOLATILITY_WINDOW:])
-    return abs(r[-1] - r[0]) / (r.std() + 1e-6)
+def record_trade_log(direction, stake, confidence, profit):
+    trade_log.appendleft({
+        "Direction": direction,
+        "Stake": f"{stake:.2f}",
+        "Confidence": f"{confidence:.2f}",
+        "Profit": f"{profit:.2f}"
+    })
 
-# ================= EQUITY LOGIC =================
-def update_equity_lock():
-    global EQUITY_LOCK
-    if BALANCE > EQUITY_LOCK + EQUITY_STEP:
-        EQUITY_LOCK = BALANCE
-
-def update_session_lock():
-    global SESSION_LOCK
-    if BALANCE > SESSION_LOCK * (1 + SESSION_LOCK_PCT):
-        SESSION_LOCK = BALANCE
-
-def update_profit_vault():
-    global PROFIT_VAULT
-    if BALANCE - PROFIT_VAULT >= VAULT_STEP:
-        PROFIT_VAULT += VAULT_STEP
-
-def equity_lock_check():
-    global PAUSE_TRADING, HARD_LOCK
-    if EQUITY_LOCK == 0:
-        return True
-    dd = (EQUITY_LOCK - BALANCE) / EQUITY_LOCK
-    tol = LOCK_TOLERANCE if regime_strength() > 1.2 else LOCK_TOLERANCE / 2
-    if dd > tol * 2:
-        HARD_LOCK = True
-        return False
-    if dd > tol:
-        PAUSE_TRADING = True
-        return False
-    return True
-
-def risk_multiplier():
-    if EQUITY_LOCK == 0:
-        return 1.0
-    dd = max(0, (EQUITY_LOCK - BALANCE) / EQUITY_LOCK)
-    return max(0.2, 1 - dd * 3)
-
-def calculate_dynamic_stake(conf):
-    tradable = max(0, BALANCE - PROFIT_VAULT)
-    return min(BASE_STAKE + conf * tradable * TRADE_RISK_FRAC, MAX_STAKE)
-
-# ================= TRADING =================
+# ================= ALPHA TRADING =================
 def evaluate_and_trade():
     global last_proposal_time, TRADE_AMOUNT, last_direction
 
-    with lock:
-        if trade_in_progress or HARD_LOCK or PAUSE_TRADING:
-            return
-        if time.time() - last_proposal_time < PROPOSAL_COOLDOWN:
-            return
-        if not tradable_market() or not equity_lock_check():
-            return
+    if stop_bot or time.time() - last_proposal_time < PROPOSAL_COOLDOWN:
+        return
+    if not session_loss_check() or len(tick_history) < VOLATILITY_WINDOW:
+        return
 
-        f = extract_features()
-        if f is None:
-            return
+    recent_std = np.array(list(tick_history)[-VOLATILITY_WINDOW:]).std()
+    if recent_std < VOLATILITY_THRESHOLD:
+        return
 
-        direction = "up" if learner.predict(f) == 1 else "down"
-        conf = learner.confidence(f)
-        if conf < 0.25:
-            return
+    features = extract_features()
+    if features is None:
+        return
 
-        stake = calculate_dynamic_stake(conf) * risk_multiplier()
-        stake = min(stake, MAX_STAKE)
+    direction_val, raw_confidence = learner.predict(features)
 
-        trade_queue.append((direction, 1, stake))
-        last_proposal_time = time.time()
-        last_direction = direction
-        process_trade_queue()
+    ema_fast = calculate_ema(np.array(tick_buffer), EMA_FAST)
+    ema_slow = calculate_ema(np.array(tick_buffer), EMA_SLOW)
+    if ema_fast and ema_slow:
+        ema_direction = 1 if ema_fast > ema_slow else -1
+        if direction_val != ema_direction:
+            raw_confidence *= 0.5
+
+    confidence = learner.confidence_adjusted() * raw_confidence
+    TRADE_AMOUNT = calculate_dynamic_stake(confidence)
+
+    direction = "up" if direction_val == 1 else "down"
+
+    trade_queue.append((direction, 1, TRADE_AMOUNT))
+    last_proposal_time = time.time()
+    last_direction = direction
+    process_trade_queue()
 
 def process_trade_queue():
     global trade_in_progress
     if trade_queue and not trade_in_progress:
-        d, dur, s = trade_queue.popleft()
-        ct = "CALL" if d == "up" else "PUT"
-        ws.send(json.dumps({
-            "proposal": 1,
-            "amount": s,
-            "basis": "stake",
-            "contract_type": ct,
-            "currency": "USD",
-            "duration": dur,
-            "duration_unit": "t",
-            "symbol": SYMBOL
-        }))
-        trade_in_progress = True
+        direction, duration, stake = trade_queue.popleft()
+        send_proposal(direction, duration, stake)
+
+def send_proposal(direction, duration, stake):
+    global trade_in_progress
+    ct = "CALL" if direction == "up" else "PUT"
+    ws.send(json.dumps({
+        "proposal": 1,
+        "amount": stake,
+        "basis": "stake",
+        "contract_type": ct,
+        "currency": "USD",
+        "duration": duration,
+        "duration_unit": "t",
+        "symbol": SYMBOL
+    }))
+    log_proposal(ct, stake)
+    trade_in_progress = True
 
 def on_contract_settlement(c):
-    global BALANCE, MAX_BALANCE, WINS, LOSSES, TRADE_COUNT, trade_in_progress
+    global BALANCE, WINS, LOSSES, TRADE_COUNT, trade_in_progress, MAX_BALANCE
     profit = float(c.get("profit") or 0)
     BALANCE += profit
     MAX_BALANCE = max(MAX_BALANCE, BALANCE)
-
     WINS += profit > 0
     LOSSES += profit <= 0
     TRADE_COUNT += 1
     trade_in_progress = False
+    record_trade_log(last_direction or "N/A", TRADE_AMOUNT, learner.confidence_adjusted(), profit)
+    log_trade(last_direction or "N/A", TRADE_AMOUNT, profit)
 
-    f = extract_features()
-    if f is not None:
-        learner.update(f, profit)
+    features = extract_features()
+    if features is not None:
+        learner.update(features, profit)
 
-    if profit > 0:
-        update_equity_lock()
-        update_session_lock()
-        update_profit_vault()
-
-# ================= WEBSOCKET =================
-def start_ws():
-    global ws
-    url = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-
-    def on_open(w):
-        w.send(json.dumps({"authorize": API_TOKEN}))
-
-    def on_message(w, m):
-        global BALANCE, SESSION_START_BALANCE, SESSION_LOCK
-        d = json.loads(m)
-
-        if "authorize" in d:
-            w.send(json.dumps({"balance": 1, "subscribe": 1}))
-            w.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
-            w.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
-            SESSION_START_BALANCE = BALANCE
-            SESSION_LOCK = BALANCE
-
-        if "balance" in d:
-            BALANCE = float(d["balance"]["balance"])
-
-        if "tick" in d:
-            t = float(d["tick"]["quote"])
-            tick_history.append(t)
-            tick_buffer.append(t)
-            evaluate_and_trade()
-
-        if "proposal" in d:
-            time.sleep(PROPOSAL_DELAY)
-            w.send(json.dumps({"buy": d["proposal"]["id"], "price": TRADE_AMOUNT}))
-
-        if "proposal_open_contract" in d:
-            c = d["proposal_open_contract"]
-            if c.get("is_sold") or c.get("is_expired"):
-                on_contract_settlement(c)
-
-    ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_message)
-    threading.Thread(target=ws.run_forever, daemon=True).start()
-
-# ================= DASHBOARD =================
-def dashboard():
-    with Live(refresh_per_second=1):
+# ================= DASHBOARD ALPHA =================
+def dashboard_loop():
+    with Live(auto_refresh=True, refresh_per_second=1) as live:
+        last_trade_count = -1
         while True:
-            table = Table(title="🚀 MOMENTO BOT — CAPITAL AWARE")
-            table.add_column("Metric")
-            table.add_column("Value")
-            table.add_row("Balance", f"{BALANCE:.2f}")
-            table.add_row("Equity Lock", f"{EQUITY_LOCK:.2f}")
-            table.add_row("Profit Vault", f"{PROFIT_VAULT:.2f}")
-            table.add_row("Trades", str(TRADE_COUNT))
-            table.add_row("Wins / Losses", f"{WINS} / {LOSSES}")
-            console.print(table)
-            time.sleep(2)
+            table = Table(title="🚀 Momento Bot Dashboard [ALPHA MODE]")
+            table.add_column("Metric", justify="left")
+            table.add_column("Value", justify="right")
 
-# ================= START =================
-if __name__ == "__main__":
-    console.print("🚀 MOMENTO BOT STARTED — NEXT GEN")
-    start_ws()
-    threading.Thread(target=dashboard, daemon=True).start()
-    while True:
-        time.sleep(10)
+            table.add_row("Balance", f"{BALANCE:.2f}")
+            table.add_row("Max Balance", f"{MAX_BALANCE:.2f}")
+            table.add_row("Trades", str(TRADE_COUNT))
+            table.add_row("Wins", str(WINS))
+            table.add_row("Losses", str(LOSSES))
+            table.add_row("Alpha Score", f"{dashboard_alpha_score():.2f}")
+
+            if TRADE_COUNT == last_trade_count:
+                log_heartbeat()
+                table.add_row("❤️ HEARTBEAT", datetime.now().strftime("%H:%M:%S") + " | No new trades")
+            else:
+                last_trade_count = TRADE_COUNT
+                table.add_row("✅ Last Trade Update", f"Balance={BALANCE:.2f}")
+
+            table.add_section()
+            table.add_row("[bold]Last Trades[/bold]", "")
+            trade_table = Table()
+            trade_table.add_column("Dir")
+            trade_table.add_column("Stake")
+            trade_table.add_column("Conf")
+            trade_table.add_column("Profit")
+
+            for t in trade_log:
+                profit = float(t["Profit"])
+                profit_text = Text(f"{profit:.2f}")
+                if profit > 0:
+                    profit_text.stylize("green")
+                elif profit < 0:
+                    profit_text.stylize("red")
+                trade_table.add_row(
+                    t["Direction"],
+                    t["Stake"],
+                    t["Confidence"],
+                    profit_text
+                )
+
+            table.add_row("", trade_table)
+            live.update(table)
+            time.sleep(1)
+
+def dashboard_alpha_score():
+    if not learner.signal_history:
+        return 0.0
+    alpha_score = sum((p if d==1 else -p) for d,p in learner.signal_history) / len(learner.signal_history)
+    return alpha_score
+
+# ================= LOGGING FUNCTIONS =================
+def log_tick(tick):
+    ts = datetime.now().strftime("%H:%M:%S")
+    console.log(f"[bold cyan][{ts}] TICK {tick:.4f}[/bold cyan]")
+
+def log_trade(direction, stake, profit):
+    ts = datetime.now().strftime("%H:%M:%S")
+    if profit > 0:
+        console.log(f"[green][{ts}] ✅ Trade {direction} | Stake=${stake:.2f} | Profit=${profit:.2f}[/green]")
+    elif profit < 0:
+        console.log(f"[red][{ts}] ❌ Trade {direction} | Stake=${stake:.2f} | Loss=${profit:.2f}[/red]")
+    else:
+        console.log(f"[yellow][{ts}] ⚪ Trade {direction} | Stake=${stake:.2f} | Break-even[/yellow]")
+
+def log_proposal(direction, stake):
+    ts = datetime.now().strftime("%H:%M:%S")
+    console.log(f"[magenta][{ts}] 📤 Proposal sent {direction.upper()} | Stake=${stake:.2f}[/magenta]")
+
+def log_heartbeat():
+    ts = datetime.now().strftime("%H:%M:%S")
+    console.log(f"[blue][{ts}] ❤️ HEARTBEAT: Bot running, no new trades[/blue]")
