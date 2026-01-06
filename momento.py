@@ -1,8 +1,6 @@
-import os, json, threading, time, websocket, numpy as np, pickle
+import os, json, time, threading, websocket, numpy as np
 from collections import deque
-from rich.console import Console
-from rich.table import Table
-from rich.live import Live
+from datetime import datetime
 
 # ================= CONFIG =================
 API_TOKEN = os.getenv("DERIV_API_TOKEN")
@@ -13,282 +11,268 @@ if not API_TOKEN or not APP_ID:
 
 SYMBOL = "R_75"
 
-BASE_STAKE = 1.0
-MAX_STAKE = 200.0
+BASE_STAKE = 2.0
+EMA_FAST = 5
+EMA_SLOW = 15
+TICKS_PER_CANDLE = 10
+BREAKOUT_LOOKBACK = 25
 
-EMA_FAST = 3
-EMA_SLOW = 10
-MICRO_SLICE = 10
+# Kelly
+KELLY_FRACTION = 0.3
+KELLY_CAP = 0.05
+MIN_KELLY_TRADES = 12
 
-VOL_WINDOW = 15
-VOL_THRESHOLD = 0.00025
+# Bayesian
+BAYES_ALPHA = 2.0
+BAYES_BETA = 2.0
 
-LOSS_STREAK_LIMIT = 3
-MAX_DD = 0.10
-
-PROPOSAL_COOLDOWN = 2
-PROPOSAL_DELAY = 2
-
-STATE_FILE = "/tmp/learner_state.pkl"
+# Engine safety
+ENGINE_WINDOW = 30
+ENGINE_MIN_TRADES = 10
+ENGINE_MAX_DD = -0.12
+ENGINE_COOLDOWN = 300
 
 # ================= STATE =================
-tick_history = deque(maxlen=500)
-tick_buffer = deque(maxlen=MICRO_SLICE)
-trade_queue = deque(maxlen=10)
+tick_history = deque(maxlen=1000)
+candle_buffer = deque(maxlen=300)
+current_candle = []
 
 BALANCE = 0.0
-MAX_BALANCE = 0.0
-TRADE_COUNT = 0
-LOSS_STREAK = 0
-TRADE_AMOUNT = BASE_STAKE
-trade_in_progress = False
-last_direction = None
-LAST_LOSS_DIRECTION = None
-last_proposal_time = 0
+WINS = 0
+LOSSES = 0
+
+trade_queue = deque()
+OPEN_CONTRACT = None
+last_trade_time = 0
 
 ws = None
-console = Console()
+lock = threading.Lock()
 
-# ================= LEARNER =================
-class OnlineLearner:
-    def __init__(self, n):
-        self.w = np.zeros(n)
-        self.b = 0.0
-        self.lr = 0.08
+# ================= ENGINE STATE =================
+engine_state = {
+    k: {
+        "enabled": True,
+        "pnl": deque(maxlen=ENGINE_WINDOW),
+        "alpha": BAYES_ALPHA,
+        "beta": BAYES_BETA,
+        "disabled_at": None
+    }
+    for k in ["Momentum", "Compression", "Breakout"]
+}
 
-    def predict(self, x):
-        z = np.dot(self.w, x) + self.b
-        z = max(min(z, 100), -100)
-        p = 1 / (1 + np.exp(-z))
-        conf = abs(p - 0.5) * 2
-        return ("up" if z > 0 else "down"), conf
+# ================= LOGGING =================
+def log(msg):
+    print(f"[{datetime.utcnow().isoformat()}] {msg}", flush=True)
 
-    def update(self, x, profit):
-        y = 1 if profit > 0 else -1
-        z = np.dot(self.w, x) + self.b
-        y_hat = 1 if z > 0 else -1
-        err = y - y_hat
-        self.w += self.lr * err * x
-        self.b += self.lr * err
-
-    def save(self):
-        try:
-            with open(STATE_FILE, "wb") as f:
-                pickle.dump((self.w, self.b), f)
-        except:
-            pass
-
-    def load(self):
-        if os.path.exists(STATE_FILE):
-            try:
-                with open(STATE_FILE, "rb") as f:
-                    self.w, self.b = pickle.load(f)
-            except:
-                pass
-
-learner = OnlineLearner(4)
-learner.load()
-
-# ================= UTILS =================
-def ema(data, p):
-    if len(data) < p:
-        return 0.0
-    w = np.exp(np.linspace(-1, 0, p))
-    w /= w.sum()
-    return np.convolve(data[-p:], w, mode="valid")[0]
-
-def features():
-    if len(tick_buffer) < MICRO_SLICE:
+# ================= UTIL =================
+def ema(data, period):
+    if len(data) < period:
         return None
-    a = np.array(tick_buffer)
-    return np.array([
-        ema(a, EMA_FAST),
-        ema(a, EMA_SLOW),
-        a[-1] - a[0],
-        max(a.std(), 1e-6)
-    ])
+    w = np.exp(np.linspace(-1., 0., period))
+    w /= w.sum()
+    return np.convolve(data[-period:], w, mode="valid")[0]
 
-# ================= REGIME CLASSIFIER =================
-def classify_regime():
-    if len(tick_history) < VOL_WINDOW:
-        return "NONE"
+def build_candle(price):
+    global current_candle
+    current_candle.append(price)
+    if len(current_candle) >= TICKS_PER_CANDLE:
+        o, h, l, c = current_candle[0], max(current_candle), min(current_candle), current_candle[-1]
+        candle_buffer.append((o, h, l, c))
+        current_candle = []
+        return True
+    return False
 
-    recent = np.array(list(tick_history)[-VOL_WINDOW:])
-    vol = recent.std()
-    fast = ema(recent, EMA_FAST)
-    slow = ema(recent, EMA_SLOW)
-    sep = abs(fast - slow)
-    momentum = recent[-1] - recent[0]
+# ================= REGIME =================
+def detect_market_regime():
+    if len(candle_buffer) < 30:
+        return "idle", 0.0
 
-    if vol < VOL_THRESHOLD or sep < vol * 0.1:
-        return "CHOP"
+    closes = np.array([c[3] for c in candle_buffer])
+    returns = np.diff(closes)
+    vol = np.std(returns)
 
-    if vol > VOL_THRESHOLD * 1.8 and abs(momentum) > vol * 0.8:
-        return "BREAKOUT"
+    ef, es = ema(closes, EMA_FAST), ema(closes, EMA_SLOW)
+    if ef is None or es is None:
+        return "idle", 0.0
 
-    return "TREND"
+    diff = abs(ef - es)
+
+    if diff > vol * 1.2:
+        return "trend", min(1.0, diff / (vol + 1e-6))
+
+    if vol < np.percentile(np.abs(returns), 30):
+        return "compression", min(1.0, (0.002 - vol) / 0.002)
+
+    return "idle", 0.0
+
+# ================= ENGINES =================
+def momentum_engine():
+    closes = np.array([c[3] for c in candle_buffer])
+    ef, es = ema(closes, EMA_FAST), ema(closes, EMA_SLOW)
+    if ef is None or es is None:
+        return None, 0.0
+    d = ef - es
+    return ("up" if d > 0 else "down"), min(abs(d) * 50, 1.0)
+
+def compression_engine():
+    recent = candle_buffer[-20:]
+    highs, lows = [c[1] for c in recent], [c[2] for c in recent]
+    rng = max(highs) - min(lows)
+    if rng < 0.002:
+        return None, 0.0
+    close = recent[-1][3]
+    edge = min(rng * 100, 1.0)
+    if close >= max(highs) - 0.15 * rng:
+        return "down", edge
+    if close <= min(lows) + 0.15 * rng:
+        return "up", edge
+    return None, 0.0
+
+def breakout_engine():
+    if len(candle_buffer) < BREAKOUT_LOOKBACK + 2:
+        return None, 0.0
+    prev = list(candle_buffer)[-BREAKOUT_LOOKBACK:-1]
+    last = candle_buffer[-1]
+    hi, lo = max(c[1] for c in prev), min(c[2] for c in prev)
+    rng = hi - lo
+    if rng < 0.002:
+        return None, 0.0
+    if last[3] > hi:
+        return "up", min(rng * 120, 1.0)
+    if last[3] < lo:
+        return "down", min(rng * 120, 1.0)
+    return None, 0.0
+
+ENGINES = {
+    "Momentum": momentum_engine,
+    "Compression": compression_engine,
+    "Breakout": breakout_engine
+}
 
 # ================= RISK =================
-def session_ok():
-    if MAX_BALANCE == 0:
-        return True
-    dd = (MAX_BALANCE - BALANCE) / MAX_BALANCE
-    return dd < MAX_DD
+def bayes_win(engine):
+    s = engine_state[engine]
+    return s["alpha"] / (s["alpha"] + s["beta"])
 
-def dynamic_stake(conf, regime):
-    core = BASE_STAKE
-    bonus = conf * BASE_STAKE * (2.0 if regime == "BREAKOUT" else 1.0)
-    stake = core + bonus
-
-    if LOSS_STREAK >= LOSS_STREAK_LIMIT:
-        stake *= 0.5
-
-    return min(stake, MAX_STAKE)
+def kelly(engine, balance):
+    pnl = list(engine_state[engine]["pnl"])
+    if len(pnl) < MIN_KELLY_TRADES:
+        return BASE_STAKE
+    wins = [p for p in pnl if p > 0]
+    losses = [-p for p in pnl if p < 0]
+    if not wins or not losses:
+        return BASE_STAKE
+    wr = bayes_win(engine)
+    edge = wr * np.mean(wins) - (1 - wr) * np.mean(losses)
+    var = np.mean(np.abs(pnl)) + 1e-6
+    frac = max(0.0, edge / var) * KELLY_FRACTION
+    return min(balance * frac, balance * KELLY_CAP)
 
 # ================= TRADING =================
-def evaluate():
-    global last_proposal_time, TRADE_AMOUNT, last_direction
-
-    if trade_in_progress:
-        return
-    if time.time() - last_proposal_time < PROPOSAL_COOLDOWN:
-        return
-    if not session_ok():
+def evaluate_trades():
+    global last_trade_time
+    regime, conf = detect_market_regime()
+    if regime == "idle" or conf < 0.4:
         return
 
-    regime = classify_regime()
-    if regime == "CHOP":
+    trades, total_edge = [], 0
+    for name, fn in ENGINES.items():
+        if not engine_state[name]["enabled"]:
+            continue
+        d, e = fn()
+        if d and e > 0.3:
+            trades.append((name, d, e))
+            total_edge += e
+
+    if not trades or total_edge < 1.3:
         return
 
-    f = features()
-    if f is None:
+    for name, d, e in trades:
+        stake = kelly(name, BALANCE) * (e / total_edge)
+        trade_queue.append((name, d, stake))
+
+    process_trade()
+
+def process_trade():
+    global OPEN_CONTRACT
+    if OPEN_CONTRACT or not trade_queue:
         return
 
-    direction, conf = learner.predict(f)
-
-    if TRADE_COUNT < 20:
-        conf = min(conf, 0.4)
-
-    conf *= max(0.3, 1 - LOSS_STREAK * 0.25)
-
-    if LOSS_STREAK >= 2 and direction == LAST_LOSS_DIRECTION:
-        return
-
-    if conf < 0.1:
-        return
-
-    TRADE_AMOUNT = dynamic_stake(conf, regime)
-    trade_queue.append((direction, 1, TRADE_AMOUNT))
-    last_direction = direction
-    last_proposal_time = time.time()
-    process_queue()
-
-def process_queue():
-    global trade_in_progress
-    if trade_queue and not trade_in_progress:
-        d, dur, s = trade_queue.popleft()
-        send_proposal(d, dur, s)
-
-def send_proposal(d, dur, s):
-    global trade_in_progress
+    name, d, stake = trade_queue.popleft()
     ct = "CALL" if d == "up" else "PUT"
+
     ws.send(json.dumps({
         "proposal": 1,
-        "amount": s,
+        "amount": round(stake, 2),
         "basis": "stake",
         "contract_type": ct,
         "currency": "USD",
-        "duration": dur,
+        "duration": 5,
         "duration_unit": "t",
         "symbol": SYMBOL
     }))
-    console.log(f"[magenta]{ct} | Stake {s:.2f}[/magenta]")
-    trade_in_progress = True
 
-def settle(c):
-    global BALANCE, MAX_BALANCE, TRADE_COUNT, LOSS_STREAK
-    global trade_in_progress, LAST_LOSS_DIRECTION
-
-    profit = float(c.get("profit", 0))
-    BALANCE += profit
-    MAX_BALANCE = max(MAX_BALANCE, BALANCE)
-    TRADE_COUNT += 1
-    LOSS_STREAK = LOSS_STREAK + 1 if profit <= 0 else 0
-    LAST_LOSS_DIRECTION = last_direction if profit <= 0 else None
-
-    trade_in_progress = False
-    console.log(f"[green]P/L {profit:.2f} | Balance {BALANCE:.2f}[/green]")
-
-    f = features()
-    if f is not None:
-        learner.update(f, profit)
-        learner.save()
+    OPEN_CONTRACT = name
+    log(f"📤 Proposal {name} {ct} stake={stake:.2f}")
 
 # ================= WS =================
-def resub():
-    ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
-    ws.send(json.dumps({"balance": 1, "subscribe": 1}))
-    ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
-
 def start_ws():
     global ws
-    url = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-    console.log(f"Connecting {url}")
 
     def on_open(w):
+        log("Connected → Authorizing")
         w.send(json.dumps({"authorize": API_TOKEN}))
 
     def on_message(w, msg):
-        try:
-            d = json.loads(msg)
+        global BALANCE, WINS, LOSSES, OPEN_CONTRACT
 
-            if "authorize" in d and not d["authorize"].get("error"):
-                resub()
+        d = json.loads(msg)
 
-            if "tick" in d:
-                t = float(d["tick"]["quote"])
-                tick_history.append(t)
-                tick_buffer.append(t)
-                evaluate()
+        if "authorize" in d:
+            w.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
+            w.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
+            w.send(json.dumps({"balance": 1, "subscribe": 1}))
 
-            if "proposal" in d:
-                time.sleep(PROPOSAL_DELAY)
-                w.send(json.dumps({"buy": d["proposal"]["id"], "price": TRADE_AMOUNT}))
+        if "tick" in d:
+            p = float(d["tick"]["quote"])
+            tick_history.append(p)
+            if build_candle(p):
+                evaluate_trades()
 
-            if "proposal_open_contract" in d:
-                c = d["proposal_open_contract"]
-                if c.get("is_sold") or c.get("is_expired"):
-                    settle(c)
+        if "proposal" in d:
+            w.send(json.dumps({"buy": d["proposal"]["id"], "price": d["proposal"]["ask_price"]}))
 
-            if "balance" in d:
-                global BALANCE
-                BALANCE = float(d["balance"]["balance"])
+        if "proposal_open_contract" in d:
+            c = d["proposal_open_contract"]
+            if c.get("is_sold"):
+                profit = float(c.get("profit", 0))
+                BALANCE += profit
+                engine = OPEN_CONTRACT
+                OPEN_CONTRACT = None
 
-        except Exception as e:
-            console.log(f"[red]WS error {e}[/red]")
+                if engine in engine_state:
+                    engine_state[engine]["pnl"].append(profit)
+                    if profit > 0:
+                        engine_state[engine]["alpha"] += 1
+                        WINS += 1
+                    else:
+                        engine_state[engine]["beta"] += 1
+                        LOSSES += 1
 
+                log(f"💰 {engine} P/L={profit:.2f} BAL={BALANCE:.2f}")
+
+        if "balance" in d:
+            BALANCE = float(d["balance"]["balance"])
+
+    url = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
     ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_message)
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
-# ================= DASHBOARD =================
-def dashboard():
-    with Live(refresh_per_second=1) as live:
-        while True:
-            t = Table(title="🚀 MOMENTO BOT — REGIME ENGINE")
-            t.add_column("Metric")
-            t.add_column("Value")
-            t.add_row("Balance", f"{BALANCE:.2f}")
-            t.add_row("Max Balance", f"{MAX_BALANCE:.2f}")
-            t.add_row("Trades", str(TRADE_COUNT))
-            t.add_row("Loss Streak", str(LOSS_STREAK))
-            t.add_row("Regime", classify_regime())
-            live.update(t)
-            time.sleep(1)
-
 # ================= START =================
 if __name__ == "__main__":
-    console.print("[green]🚀 MOMENTO BOT STARTED — REGIME AWARE[/green]")
+    log("🚀 Bayesian Kelly Bot — KOYEB READY")
     start_ws()
-    threading.Thread(target=dashboard, daemon=True).start()
+
     while True:
-        time.sleep(10)
+        log("❤️ HEARTBEAT")
+        time.sleep(30)
