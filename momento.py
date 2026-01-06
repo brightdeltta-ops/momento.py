@@ -1,5 +1,3 @@
-# ================= ALPHA-UPGRADED MOMENTO BOT CORE =================
-
 import json, threading, time, websocket, numpy as np, os
 from collections import deque
 from rich.console import Console
@@ -43,7 +41,6 @@ last_direction = None
 stop_bot = False
 
 ws = None
-lock = threading.Lock()
 console = Console()
 
 # ================= ALPHA LEARNER =================
@@ -121,7 +118,84 @@ def record_trade_log(direction, stake, confidence, profit):
         "Profit": f"{profit:.2f}"
     })
 
-# ================= ALPHA TRADING =================
+# ================= LOGGING =================
+def log_tick(tick):
+    ts = datetime.now().strftime("%H:%M:%S")
+    console.log(f"[bold cyan][{ts}] TICK {tick:.4f}[/bold cyan]")
+
+def log_trade(direction, stake, profit):
+    ts = datetime.now().strftime("%H:%M:%S")
+    if profit > 0:
+        console.log(f"[green][{ts}] ✅ Trade {direction} | Stake=${stake:.2f} | Profit=${profit:.2f}[/green]")
+    elif profit < 0:
+        console.log(f"[red][{ts}] ❌ Trade {direction} | Stake=${stake:.2f} | Loss=${profit:.2f}[/red]")
+    else:
+        console.log(f"[yellow][{ts}] ⚪ Trade {direction} | Stake=${stake:.2f} | Break-even[/yellow]")
+
+def log_proposal(direction, stake):
+    ts = datetime.now().strftime("%H:%M:%S")
+    console.log(f"[magenta][{ts}] 📤 Proposal sent {direction.upper()} | Stake=${stake:.2f}[/magenta]")
+
+def log_heartbeat():
+    ts = datetime.now().strftime("%H:%M:%S")
+    console.log(f"[blue][{ts}] ❤️ HEARTBEAT: Bot running, no new trades[/blue]")
+
+# ================= ALPHA DASHBOARD =================
+def dashboard_alpha_score():
+    if not learner.signal_history:
+        return 0.0
+    alpha_score = sum((p if d==1 else -p) for d,p in learner.signal_history) / len(learner.signal_history)
+    return alpha_score
+
+def dashboard_loop():
+    with Live(auto_refresh=True, refresh_per_second=1) as live:
+        last_trade_count = -1
+        while True:
+            table = Table(title="🚀 Momento Bot Dashboard [ALPHA MODE]")
+            table.add_column("Metric", justify="left")
+            table.add_column("Value", justify="right")
+
+            table.add_row("Balance", f"{BALANCE:.2f}")
+            table.add_row("Max Balance", f"{MAX_BALANCE:.2f}")
+            table.add_row("Trades", str(TRADE_COUNT))
+            table.add_row("Wins", str(WINS))
+            table.add_row("Losses", str(LOSSES))
+            table.add_row("Alpha Score", f"{dashboard_alpha_score():.2f}")
+
+            if TRADE_COUNT == last_trade_count:
+                log_heartbeat()
+                table.add_row("❤️ HEARTBEAT", datetime.now().strftime("%H:%M:%S") + " | No new trades")
+            else:
+                last_trade_count = TRADE_COUNT
+                table.add_row("✅ Last Trade Update", f"Balance={BALANCE:.2f}")
+
+            table.add_section()
+            table.add_row("[bold]Last Trades[/bold]", "")
+            trade_table = Table()
+            trade_table.add_column("Dir")
+            trade_table.add_column("Stake")
+            trade_table.add_column("Conf")
+            trade_table.add_column("Profit")
+
+            for t in trade_log:
+                profit = float(t["Profit"])
+                profit_text = Text(f"{profit:.2f}")
+                if profit > 0:
+                    profit_text.stylize("green")
+                elif profit < 0:
+                    profit_text.stylize("red")
+                trade_table.add_row(
+                    t["Direction"],
+                    t["Stake"],
+                    t["Confidence"],
+                    profit_text
+                )
+
+            table.add_row("", trade_table)
+            live.update(table)
+            time.sleep(1)
+
+# ================= TRADING =================
 def evaluate_and_trade():
     global last_proposal_time, TRADE_AMOUNT, last_direction
 
@@ -195,79 +269,80 @@ def on_contract_settlement(c):
     if features is not None:
         learner.update(features, profit)
 
-# ================= DASHBOARD ALPHA =================
-def dashboard_loop():
-    with Live(auto_refresh=True, refresh_per_second=1) as live:
-        last_trade_count = -1
+# ================= WEBSOCKET =================
+def resubscribe():
+    ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
+    ws.send(json.dumps({"balance": 1, "subscribe": 1}))
+    ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
+    console.log("[green]Subscribed to ticks, balance, contracts[/green]")
+
+def start_ws():
+    global ws
+    DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+    console.log(f"[yellow]Connecting to Deriv WebSocket at {DERIV_WS}[/yellow]")
+
+    def on_open(w):
+        console.log("[green]WebSocket connected[/green]")
+        w.send(json.dumps({"authorize": API_TOKEN}))
+
+    def on_message(ws, msg):
+        try:
+            data = json.loads(msg)
+            if "authorize" in data:
+                if data["authorize"].get("error"):
+                    console.log(f"[red]Auth failed: {data['authorize']['error']}[/red]")
+                else:
+                    console.log("[green]✅ Authorized[/green]")
+                    resubscribe()
+            if "tick" in data:
+                tick = float(data["tick"]["quote"])
+                tick_history.append(tick)
+                tick_buffer.append(tick)
+                log_tick(tick)
+                evaluate_and_trade()
+            if "proposal" in data:
+                time.sleep(PROPOSAL_DELAY)
+                ws.send(json.dumps({"buy": data["proposal"]["id"], "price": TRADE_AMOUNT}))
+            if "proposal_open_contract" in data:
+                c = data["proposal_open_contract"]
+                if c.get("is_sold") or c.get("is_expired"):
+                    on_contract_settlement(c)
+            if "balance" in data:
+                global BALANCE
+                BALANCE = float(data["balance"]["balance"])
+        except Exception as e:
+            console.log(f"[red]on_message error: {e}[/red]")
+
+    def on_error(ws, error):
+        console.log(f"[red]WebSocket ERROR: {error}[/red]")
+
+    def on_close(ws, code, msg):
+        console.log(f"[red]WebSocket closed | Code: {code} | Msg: {msg}[/red]")
+
+    ws = websocket.WebSocketApp(
+        DERIV_WS,
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
+    )
+
+    threading.Thread(target=ws.run_forever, daemon=True).start()
+
+# ================= MAIN LOOP =================
+if __name__ == "__main__":
+    console.print("[green]🚀 Alpha Momento Bot starting...[/green]")
+
+    # Start websocket
+    start_ws()
+
+    # Start dashboard
+    threading.Thread(target=dashboard_loop, daemon=True).start()
+
+    # Keep main thread alive
+    try:
         while True:
-            table = Table(title="🚀 Momento Bot Dashboard [ALPHA MODE]")
-            table.add_column("Metric", justify="left")
-            table.add_column("Value", justify="right")
-
-            table.add_row("Balance", f"{BALANCE:.2f}")
-            table.add_row("Max Balance", f"{MAX_BALANCE:.2f}")
-            table.add_row("Trades", str(TRADE_COUNT))
-            table.add_row("Wins", str(WINS))
-            table.add_row("Losses", str(LOSSES))
-            table.add_row("Alpha Score", f"{dashboard_alpha_score():.2f}")
-
-            if TRADE_COUNT == last_trade_count:
-                log_heartbeat()
-                table.add_row("❤️ HEARTBEAT", datetime.now().strftime("%H:%M:%S") + " | No new trades")
-            else:
-                last_trade_count = TRADE_COUNT
-                table.add_row("✅ Last Trade Update", f"Balance={BALANCE:.2f}")
-
-            table.add_section()
-            table.add_row("[bold]Last Trades[/bold]", "")
-            trade_table = Table()
-            trade_table.add_column("Dir")
-            trade_table.add_column("Stake")
-            trade_table.add_column("Conf")
-            trade_table.add_column("Profit")
-
-            for t in trade_log:
-                profit = float(t["Profit"])
-                profit_text = Text(f"{profit:.2f}")
-                if profit > 0:
-                    profit_text.stylize("green")
-                elif profit < 0:
-                    profit_text.stylize("red")
-                trade_table.add_row(
-                    t["Direction"],
-                    t["Stake"],
-                    t["Confidence"],
-                    profit_text
-                )
-
-            table.add_row("", trade_table)
-            live.update(table)
-            time.sleep(1)
-
-def dashboard_alpha_score():
-    if not learner.signal_history:
-        return 0.0
-    alpha_score = sum((p if d==1 else -p) for d,p in learner.signal_history) / len(learner.signal_history)
-    return alpha_score
-
-# ================= LOGGING FUNCTIONS =================
-def log_tick(tick):
-    ts = datetime.now().strftime("%H:%M:%S")
-    console.log(f"[bold cyan][{ts}] TICK {tick:.4f}[/bold cyan]")
-
-def log_trade(direction, stake, profit):
-    ts = datetime.now().strftime("%H:%M:%S")
-    if profit > 0:
-        console.log(f"[green][{ts}] ✅ Trade {direction} | Stake=${stake:.2f} | Profit=${profit:.2f}[/green]")
-    elif profit < 0:
-        console.log(f"[red][{ts}] ❌ Trade {direction} | Stake=${stake:.2f} | Loss=${profit:.2f}[/red]")
-    else:
-        console.log(f"[yellow][{ts}] ⚪ Trade {direction} | Stake=${stake:.2f} | Break-even[/yellow]")
-
-def log_proposal(direction, stake):
-    ts = datetime.now().strftime("%H:%M:%S")
-    console.log(f"[magenta][{ts}] 📤 Proposal sent {direction.upper()} | Stake=${stake:.2f}[/magenta]")
-
-def log_heartbeat():
-    ts = datetime.now().strftime("%H:%M:%S")
-    console.log(f"[blue][{ts}] ❤️ HEARTBEAT: Bot running, no new trades[/blue]")
+            time.sleep(5)
+    except KeyboardInterrupt:
+        console.print("[red]Bot stopped manually[/red]")
+        stop_bot = True
