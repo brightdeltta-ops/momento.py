@@ -7,7 +7,6 @@ from rich.live import Live
 # ================= CONFIG =================
 API_TOKEN = os.getenv("DERIV_API_TOKEN")
 APP_ID = int(os.getenv("APP_ID", "0"))
-VOLUME_PATH = "/mnt/volume"  # Koyeb persistent volume
 
 if not API_TOKEN or not APP_ID:
     raise RuntimeError("Missing DERIV_API_TOKEN or APP_ID")
@@ -26,8 +25,10 @@ LOSS_STREAK_LIMIT = 3
 PROPOSAL_COOLDOWN = 2
 PROPOSAL_DELAY = 2
 
-STATE_FILE = os.path.join(VOLUME_PATH, "learner_state.pkl")
-LOG_FILE = os.path.join(VOLUME_PATH, "trades.log")
+# ================= FILE PATHS =================
+# Use /tmp on eMicro (ephemeral storage)
+STATE_FILE = "/tmp/learner_state.pkl"
+LOG_FILE = "/tmp/trades.log"
 
 # ================= STATE =================
 tick_history = deque(maxlen=500)
@@ -69,14 +70,19 @@ class OnlineLearner:
         self.b += self.lr * err
 
     def save(self):
-        os.makedirs(VOLUME_PATH, exist_ok=True)
-        with open(STATE_FILE, "wb") as f:
-            pickle.dump((self.w, self.b), f)
+        try:
+            with open(STATE_FILE, "wb") as f:
+                pickle.dump((self.w, self.b), f)
+        except Exception as e:
+            console.log(f"[red]Warning: Could not save learner state: {e}[/red]")
 
     def load(self):
         if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "rb") as f:
-                self.w, self.b = pickle.load(f)
+            try:
+                with open(STATE_FILE, "rb") as f:
+                    self.w, self.b = pickle.load(f)
+            except Exception as e:
+                console.log(f"[red]Warning: Could not load learner state: {e}[/red]")
 
 learner = OnlineLearner(4)
 learner.load()
@@ -109,9 +115,11 @@ def session_ok():
     return dd < MAX_DD
 
 def log_trade_file(direction, stake, profit, balance):
-    os.makedirs(VOLUME_PATH, exist_ok=True)
-    with open(LOG_FILE, "a") as f:
-        f.write(f"{time.time()} | {direction} | Stake {stake:.2f} | P/L {profit:.2f} | Balance {balance:.2f}\n")
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(f"{time.time()} | {direction} | Stake {stake:.2f} | P/L {profit:.2f} | Balance {balance:.2f}\n")
+    except Exception as e:
+        console.log(f"[red]Warning: Could not write log: {e}[/red]")
 
 # ================= TRADING =================
 def evaluate():
@@ -221,7 +229,7 @@ def dashboard():
     with Live(refresh_per_second=1) as live:
         last = -1
         while True:
-            t = Table(title="🚀 MOMENTO BOT — NEXT-GEN SAFE MODE")
+            t = Table(title="🚀 MOMENTO BOT — E-MICRO MODE")
             t.add_column("Metric")
             t.add_column("Value")
             t.add_row("Balance", f"{BALANCE:.2f}")
@@ -236,7 +244,7 @@ def dashboard():
 
 # ================= START =================
 if __name__ == "__main__":
-    console.print("[green]🚀 MOMENTO BOT STARTED — NEXT-GEN ALPHA[/green]")
+    console.print("[green]🚀 MOMENTO BOT STARTED — E-MICRO READY[/green]")
     while True:
         try:
             start_ws()
