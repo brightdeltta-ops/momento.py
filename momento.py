@@ -6,146 +6,222 @@ import websocket
 import numpy as np
 from collections import deque
 
-# ================= USER CONFIG =================
-API_TOKEN = os.getenv("DERIV_API_TOKEN")  # Token from Koyeb env variable
+# =================================================
+# USER CONFIG
+# =================================================
+API_TOKEN = os.getenv("DERIV_API_TOKEN")  # Set this in Koyeb env variables
 if not API_TOKEN:
-    raise ValueError("API token not set. Please set DERIV_API_TOKEN in Koyeb environment variables.")
+    raise ValueError("Please set DERIV_API_TOKEN in Koyeb environment variables")
 
 APP_ID = 112380
 SYMBOL = "R_75"
 
-BASE_STAKE = 1.0
-MAX_STAKE = 100.0
-TRADE_RISK_FRAC = 0.02
-PROPOSAL_COOLDOWN = 6
-PROPOSAL_DELAY = 1  # seconds delay before buying proposal
-EMA_FAST = 3
-EMA_SLOW = 10
-MICRO_SLICE = 10
-VOLATILITY_WINDOW = 20
-VOLATILITY_THRESHOLD = 0.0015
-MAX_DD = 0.2  # 20% drawdown
+BASE_STAKE = 100.0
+PROPOSAL_COOLDOWN = 0.2
+EMA_SHORT = 3
+EMA_LONG = 10
+CONFIDENCE_THRESHOLD = 0.6
+MAX_LOSSES = 5000
+MAX_CONSECUTIVE_LOSSES = 9
 
-# ================= DATA TRACKING =================
+ML_ENABLED = True
+ML_WINDOW = 10
+MICRO_PATTERN_WINDOW = 5
+
+# =================================================
+# DATA STRUCTURES
+# =================================================
 tick_history = deque(maxlen=500)
-tick_buffer = deque(maxlen=MICRO_SLICE)
-trade_queue = deque(maxlen=30)
+tick_buffer = deque(maxlen=20)
+vol_buffer = deque(maxlen=20)
+trade_queue = deque(maxlen=50)
 active_trades = []
+alerts = deque(maxlen=50)
+equity_curve = []
+pattern_history = deque(maxlen=100)
 
-BALANCE = 0.0
-MAX_BALANCE = 0.0
+BALANCE = 10000.0
 WINS = 0
 LOSSES = 0
 TRADE_COUNT = 0
-TRADE_AMOUNT = BASE_STAKE
+CONSECUTIVE_LOSSES = 0
 
 trade_in_progress = False
 last_trade_time = 0
 last_proposal_time = 0
-last_direction = None
+TRADE_AMOUNT = BASE_STAKE
+
 authorized = False
 ws_running = False
 ws = None
 lock = threading.Lock()
 DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
-# ================= UTILITIES =================
+# =================================================
+# ML FUNCTIONS
+# =================================================
+ML_FEATURES = ML_WINDOW
+ML_WEIGHTS = None
+ML_BIAS = 0.0
+ML_LR = 0.05
+ML_TRAINED = False
+
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+def build_features():
+    if len(tick_buffer) < ML_FEATURES + 1:
+        return None
+    seq = np.array(list(tick_buffer)[-ML_FEATURES:])
+    diff = np.diff(seq)
+    momentum = seq[-1] - seq[-3]
+    vol = np.std(seq)
+    ema_ratio = calculate_ema(seq, EMA_SHORT)/calculate_ema(seq, EMA_LONG)
+    return np.array([*diff, momentum, vol, ema_ratio])
+
+def ml_predict_next_tick():
+    global ML_WEIGHTS, ML_BIAS, ML_TRAINED
+    X = build_features()
+    if X is None:
+        return None, 0
+    y = 1 if tick_buffer[-1] - tick_buffer[-2] > 0 else 0
+    if ML_WEIGHTS is None:
+        ML_WEIGHTS = np.zeros_like(X)
+    z = np.dot(X, ML_WEIGHTS) + ML_BIAS
+    pred_prob = sigmoid(z)
+    pred = "up" if pred_prob > 0.5 else "down"
+    error = y - pred_prob
+    ML_WEIGHTS += ML_LR * error * X
+    ML_BIAS += ML_LR * error
+    ML_TRAINED = True
+    conf = max(pred_prob, 1 - pred_prob)
+    return pred, conf
+
+# =================================================
+# UTILITIES
+# =================================================
 def append_alert(msg):
     with lock:
-        print(msg)
+        alerts.appendleft(msg)
+    print(msg)
 
 def auto_unfreeze():
     global trade_in_progress, last_trade_time
     while True:
-        time.sleep(2)
+        time.sleep(1)
         if trade_in_progress and time.time() - last_trade_time > 5:
             trade_in_progress = False
-            append_alert("⚠ Auto-unfreeze triggered")
+            append_alert("⚠ Auto-unfreeze triggered: Trade reset")
 
-def calculate_ema(data, period):
-    if len(data) < period:
+def keep_alive():
+    while True:
+        time.sleep(15)
+        try: ws.send(json.dumps({"ping":1}))
+        except: pass
+
+def calculate_ema(data, period=5):
+    arr = np.array(data[-period:])
+    if len(arr) < period:
         return None
     weights = np.exp(np.linspace(-1.,0.,period))
     weights /= weights.sum()
-    return np.convolve(data[-period:], weights, mode="valid")[0]
-
-def is_market_expanding():
-    if len(tick_history) < VOLATILITY_WINDOW:
-        return False
-    window = np.array(list(tick_history)[-VOLATILITY_WINDOW:])
-    vol = window.std()
-    return vol >= VOLATILITY_THRESHOLD
+    ema = np.convolve(arr, weights, mode='valid')
+    return float(ema[-1])
 
 def session_loss_check():
-    global BALANCE
-    max_loss = BALANCE * MAX_DD
-    return LOSSES * BASE_STAKE < max_loss
+    return LOSSES < MAX_LOSSES and CONSECUTIVE_LOSSES < MAX_CONSECUTIVE_LOSSES
 
-def calculate_dynamic_stake(confidence):
-    global BALANCE
-    base_risk = BALANCE * TRADE_RISK_FRAC
-    stake = BASE_STAKE + confidence * base_risk
-    return min(stake, MAX_STAKE)
+# =================================================
+# MICRO-PATTERN LOGIC
+# =================================================
+def update_pattern_history():
+    if len(tick_buffer) < MICRO_PATTERN_WINDOW:
+        return
+    pattern = tuple(np.sign([tick_buffer[i+1]-tick_buffer[i] for i in range(-MICRO_PATTERN_WINDOW,-1)]))
+    pattern_history.append(pattern)
 
-def check_trade_memory(direction):
-    global last_direction
-    if direction == last_direction:
-        return False
-    last_direction = direction
-    return True
+def micro_pattern_confidence():
+    if len(tick_buffer) < MICRO_PATTERN_WINDOW:
+        return 0
+    current_pattern = tuple(np.sign([tick_buffer[i+1]-tick_buffer[i] for i in range(-MICRO_PATTERN_WINDOW,-1)]))
+    matches = [p for p in pattern_history if p == current_pattern]
+    return min(len(matches)/10,1)
 
-# ================= TRADE LOGIC =================
-def get_breakout_confidence():
-    if len(tick_buffer) < 5:
-        return None, 0
-    recent = np.array(tick_buffer)
-    high, low = recent.max(), recent.min()
-    rng = high - low
-    std = recent.std()
-    if rng < 0.002:
-        return None, 0
+def get_micro_direction():
+    if len(tick_buffer) < 10:
+        return None
+    diffs = [tick_buffer[i]-tick_buffer[i-1] for i in range(1,len(tick_buffer))]
+    trend = sum(diffs[-5:])
+    chop = sum(abs(x) for x in diffs[-8:])
+    micro = diffs[-1]
+    if abs(trend) > chop*0.35:
+        return "up" if trend>0 else "down"
+    if chop < 0.12:
+        return "up" if micro>0 else "down"
+    return "up" if micro>=0 else "down"
+
+def breakout_prediction():
+    if len(vol_buffer)<10:
+        return None,0
+    recent = list(vol_buffer)[-10:]
+    highs, max_low = max(recent), min(recent)
     current = recent[-1]
-    if current >= high - 0.2 * rng:
-        return "up", min(1, std*200)
-    if current <= low + 0.2 * rng:
-        return "down", min(1, std*200)
+    rng = highs - max_low
+    std = np.std(recent)
+    if rng < 0.002:
+        return None,0
+    if current >= highs - (rng*0.2):
+        return "up", min(1,std*200)
+    if current <= max_low + (rng*0.2):
+        return "down", min(1,std*150)
     momentum = current - recent[-3]
-    return ("up" if momentum>0 else "down", min(1, abs(momentum)*150))
+    return ("up" if momentum>0 else "down", min(1,abs(momentum)*150))
 
+def order_flow_signal():
+    if len(vol_buffer) < 5:
+        return 1.0
+    recent = np.array(list(vol_buffer)[-5:])
+    spike = recent[-1] - np.mean(recent[:-1])
+    return min(max(spike*50,0),1)
+
+def combined_confidence():
+    breakout_dir, breakout_conf = breakout_prediction()
+    if breakout_dir is None:
+        return None,0
+    ema_trend = "up" if calculate_ema(list(tick_buffer), EMA_SHORT) > calculate_ema(list(tick_buffer), EMA_LONG) else "down"
+    micro_dir = get_micro_direction()
+    flow_conf = order_flow_signal()
+    pattern_conf = micro_pattern_confidence()
+    if breakout_dir != ema_trend or breakout_dir != micro_dir:
+        return None,0
+    conf = (breakout_conf*0.3 + flow_conf*0.25 + pattern_conf*0.2)
+    final_dir = breakout_dir
+    if ML_ENABLED:
+        ml_dir, ml_conf = ml_predict_next_tick()
+        if ml_dir != final_dir or ml_conf < 0.5:
+            return None,0
+        conf = conf*0.4 + ml_conf*0.6
+    if pattern_conf < 0.2:
+        return None,0
+    return final_dir, conf
+
+# =================================================
+# TRADE EXECUTION
+# =================================================
 def evaluate_and_trade():
-    global last_proposal_time, TRADE_AMOUNT
-    if time.time() - last_proposal_time < PROPOSAL_COOLDOWN:
+    global last_proposal_time
+    now = time.time()
+    if now - last_proposal_time < PROPOSAL_COOLDOWN:
         return
     if not session_loss_check():
-        append_alert("⚠ Session drawdown exceeded. Pausing trades.")
         return
-    if not is_market_expanding():
-        append_alert("⚠ Market not in expansion. Trade skipped.")
+    signal, confidence = combined_confidence()
+    if not signal or confidence < CONFIDENCE_THRESHOLD:
         return
-    direction, confidence = get_breakout_confidence()
-    if confidence < 0.5:
-        append_alert(f"⚠ Skipping low-confidence trade ({confidence:.2f})")
-        return
-    if not check_trade_memory(direction):
-        append_alert("⚠ Trade blocked by memory filter")
-        return
-    short_ema = calculate_ema(list(tick_buffer), EMA_FAST)
-    long_ema = calculate_ema(list(tick_buffer), EMA_SLOW)
-    if short_ema is None or long_ema is None:
-        return
-    ema_trend = "up" if short_ema > long_ema else "down"
-    if direction != ema_trend:
-        append_alert(f"⚠ EMA ({ema_trend}) and breakout ({direction}) mismatch")
-        return
-    if len(tick_buffer) >= 3:
-        micro_trend = tick_buffer[-1] - tick_buffer[-3]
-        if (direction=="up" and micro_trend<=0) or (direction=="down" and micro_trend>=0):
-            append_alert("⚠ Skipping micro-countertrend trade")
-            return
-    TRADE_AMOUNT = calculate_dynamic_stake(confidence)
-    trade_queue.append((direction, 1, TRADE_AMOUNT))
-    last_proposal_time = time.time()
-    append_alert(f"🚀 Queued {direction.upper()} | Stake {TRADE_AMOUNT:.2f} | Conf {confidence:.2f}")
+    stake = BASE_STAKE * confidence
+    trade_queue.append((signal,1,stake))
+    last_proposal_time = now
+    append_alert(f"📈 SIGNAL → {signal.upper()} | Stake {stake:.2f} | Conf {confidence:.2f}")
     process_trade_queue()
 
 def process_trade_queue():
@@ -154,115 +230,111 @@ def process_trade_queue():
         sig = trade_queue.popleft()
         request_proposal(sig)
 
-def request_proposal(sig):
+def request_proposal(signal_tuple):
     global TRADE_AMOUNT, trade_in_progress, last_trade_time
-    direction, duration, stake = sig
+    direction,duration,stake = signal_tuple
     TRADE_AMOUNT = stake
     ct = "CALL" if direction=="up" else "PUT"
-    proposal = {
-        "proposal": 1,
-        "amount": TRADE_AMOUNT,
-        "basis": "stake",
-        "contract_type": ct,
-        "currency": "USD",
-        "duration": duration,
-        "duration_unit": "t",
-        "symbol": SYMBOL
+    proposal={
+        "proposal":1,
+        "amount":TRADE_AMOUNT,
+        "basis":"stake",
+        "contract_type":ct,
+        "currency":"USD",
+        "duration":duration,
+        "duration_unit":"t",
+        "symbol":SYMBOL
     }
-    trade_in_progress = True
-    last_trade_time = time.time()
-    ws.send(json.dumps(proposal))
-    append_alert(f"📨 Proposal sent → {direction.upper()} | Stake {TRADE_AMOUNT:.2f}")
+    trade_in_progress=True
+    last_trade_time=time.time()
+    try: ws.send(json.dumps(proposal))
+    except: append_alert("⚠ WS not ready for proposal")
+    append_alert(f"💰 Proposal sent → {direction.upper()} | Stake {TRADE_AMOUNT:.2f}")
 
 def on_contract_settlement(c):
-    global BALANCE, WINS, LOSSES, TRADE_COUNT, trade_in_progress, MAX_BALANCE
+    global BALANCE,WINS,LOSSES,TRADE_COUNT,trade_in_progress, CONSECUTIVE_LOSSES
     profit = float(c.get("profit") or 0)
     BALANCE += profit
-    MAX_BALANCE = max(MAX_BALANCE, BALANCE)
+    equity_curve.append(BALANCE)
     if profit > 0:
         WINS += 1
+        CONSECUTIVE_LOSSES = 0
     else:
         LOSSES += 1
+        CONSECUTIVE_LOSSES += 1
     TRADE_COUNT += 1
-    trade_in_progress = False
-    append_alert(f"✔ Settlement → Profit: {profit:.2f} | Drawdown: {(MAX_BALANCE-BALANCE)/MAX_BALANCE*100 if MAX_BALANCE>0 else 0:.1f}%")
+    trade_in_progress=False
+    append_alert(f"✔ Settlement → Profit: {profit:.2f} | Balance: {BALANCE:.2f}")
     process_trade_queue()
 
-# ================= WEBSOCKET =================
-def on_message(ws, msg):
+# =================================================
+# WEBSOCKET HANDLERS
+# =================================================
+def on_message(ws,msg):
     global BALANCE, authorized
     try:
         data = json.loads(msg)
         if "authorize" in data:
-            authorized = True
-            resubscribe_channels()
+            authorized=True
+            ws.send(json.dumps({"ticks":SYMBOL,"subscribe":1}))
+            ws.send(json.dumps({"balance":1,"subscribe":1}))
+            ws.send(json.dumps({"proposal_open_contract":1,"subscribe":1}))
             append_alert("✔ Authorized")
         if "tick" in data:
-            tick = float(data["tick"]["quote"])
+            tick=float(data["tick"]["quote"])
             tick_history.append(tick)
             tick_buffer.append(tick)
+            vol_buffer.append(tick)
+            update_pattern_history()
             evaluate_and_trade()
         if "proposal" in data:
-            pid = data["proposal"]["id"]
-            time.sleep(PROPOSAL_DELAY)
-            ws.send(json.dumps({"buy": pid, "price": TRADE_AMOUNT}))
-            active_trades.append({"id": pid, "profit": 0})
+            pid=data["proposal"]["id"]
+            try: ws.send(json.dumps({"buy":pid,"price":TRADE_AMOUNT}))
+            except: append_alert("⚠ Buy proposal failed")
+            active_trades.append({"id":pid,"profit":0})
         if "proposal_open_contract" in data:
-            c = data["proposal_open_contract"]
+            c=data["proposal_open_contract"]
             if c.get("is_sold") or c.get("is_expired"):
                 on_contract_settlement(c)
                 active_trades[:] = [t for t in active_trades if t["id"] != c.get("id")]
         if "balance" in data:
-            BALANCE = float(data["balance"]["balance"])
+            BALANCE=float(data["balance"]["balance"])
+            equity_curve.append(BALANCE)
     except Exception as e:
         append_alert(f"⚠ WS Error: {e}")
-
-def resubscribe_channels():
-    if not authorized:
-        return
-    ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
-    ws.send(json.dumps({"balance": 1, "subscribe": 1}))
-    ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
-    append_alert("🔄 Resubscribed to all channels")
 
 def on_error(ws, error):
     append_alert(f"❌ WS Error: {error}")
 
-def on_close(ws, code, msg):
-    append_alert("❌ WS Closed — reconnecting in 2s")
+def on_close(ws, close_status_code, close_msg):
+    append_alert("❌ WS Closed, reconnecting in 2s")
     time.sleep(2)
     start_ws()
 
 def start_ws():
     global ws, ws_running, authorized
     if ws_running: return
-    ws_running = True
-    authorized = False
-    ws = websocket.WebSocketApp(
+    ws_running=True
+    authorized=False
+    ws=websocket.WebSocketApp(
         DERIV_WS,
-        on_open=lambda ws: ws.send(json.dumps({"authorize": API_TOKEN})),
+        on_open=lambda ws: ws.send(json.dumps({"authorize":API_TOKEN})),
         on_message=on_message,
         on_error=on_error,
         on_close=on_close
     )
-    threading.Thread(target=ws.run_forever, daemon=True).start()
+    threading.Thread(target=ws.run_forever,daemon=True).start()
 
-def keep_alive():
-    while True:
-        time.sleep(15)
-        try:
-            ws.send(json.dumps({"ping": 1}))
-        except:
-            pass
-
-# ================= START =================
+# =================================================
+# START BOT
+# =================================================
 def start():
     append_alert("🚀 MOMENTO BOT — HEADLESS KOYEB READY")
     start_ws()
-    threading.Thread(target=keep_alive, daemon=True).start()
-    threading.Thread(target=auto_unfreeze, daemon=True).start()
+    threading.Thread(target=keep_alive,daemon=True).start()
+    threading.Thread(target=auto_unfreeze,daemon=True).start()
     while True:
-        time.sleep(1)  # Keep script alive
+        time.sleep(1)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     start()
