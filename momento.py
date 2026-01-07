@@ -1,292 +1,272 @@
 # =====================================
-# MOMENTO — MULTI-CONTRACT ALPHA BOT (KOYEB READY)
+# MOMENTO — QUANT ALPHA BOT (KOYEB READY)
 # =====================================
 
-import os, json, time, threading, websocket
+import os, json, time, threading, websocket, numpy as np, pandas as pd
 from collections import deque
-import numpy as np
+import csv
 
 # ================= ENV =================
 API_TOKEN = os.getenv("DERIV_API_TOKEN")
 APP_ID = int(os.getenv("APP_ID", "112380"))
 SYMBOL = os.getenv("SYMBOL", "R_75")
-BASE_STAKE = float(os.getenv("BASE_STAKE", "1"))
+BASE_STAKE = float(os.getenv("BASE_STAKE", "50"))
 MAX_STAKE = float(os.getenv("MAX_STAKE", "100"))
+TRADE_RISK_FRAC = 0.02
 
 # ================= PARAMETERS =================
-EMA_FAST = 3
-EMA_SLOW = 10
-MICRO_SLICE = 10
-VOLATILITY_THRESHOLD = 0.0015
-PROPOSAL_COOLDOWN = 6
-PROPOSAL_DELAY = 5
-MAX_DD = 0.20
-MULTI_CONTRACTS = 2
-REGIME_CONFIRM_TICKS = 5
+EMA_FAST_BASE = 6
+EMA_SLOW_BASE = 13
+EMA_CONF = 30
+MIN_TICKS = 15
+PROPOSAL_COOLDOWN = 32
+GRADE_THRESHOLD_BASE = 0.02
+TREND_MIN = 0.003
+MIN_TRADE_INTERVAL = 64
+LOW_CONF_WAIT = 30
+
+TRADE_LOG = "trade_log.csv"
 
 # ================= STATE =================
-tick_history = deque(maxlen=500)
-tick_buffer = deque(maxlen=MICRO_SLICE)
-trade_queue = deque(maxlen=10)
-OPEN_CONTRACTS = {}
+tick_history = deque(maxlen=300)
+equity_curve = []
+alerts = deque(maxlen=50)
+trade_queue = deque(maxlen=50)
+active_trades = []
 
-BALANCE = 0.0
-MAX_BALANCE = 0.0
-WINS = LOSSES = TRADE_COUNT = 0
+BALANCE = 1000.0
+WINS = 0
+LOSSES = 0
+TRADE_COUNT = 0
 TRADE_AMOUNT = BASE_STAKE
 
-CURRENT_REGIME = None
-last_proposal_time = 0
 trade_in_progress = False
-last_direction = None
+last_trade_time = 0
+last_proposal_time = 0
+next_trade_signal = None
 
-regime_buffer = deque(maxlen=REGIME_CONFIRM_TICKS)
-LOSS_STREAKS = {"trend":0,"compression":0}
-
-alerts = deque(maxlen=40)
-json_logs = deque(maxlen=60)
-equity_curve = []
-
-lock = threading.Lock()
+authorized = False
+ws_running = False
 ws = None
+lock = threading.Lock()
 DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
-# ================= UTILITIES =================
-def log(msg):
+# ================= UTILS =================
+def append_alert(msg):
     with lock:
         alerts.appendleft(msg)
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-def calculate_ema(data, period):
-    if len(data) < period:
-        return None
-    w = np.exp(np.linspace(-1.,0.,period))
-    w /= w.sum()
-    return np.convolve(list(data)[-period:], w, mode="valid")[0]
+def safe_ws_send(msg):
+    global ws
+    try:
+        if ws: ws.send(json.dumps(msg))
+    except Exception as e:
+        append_alert(f"⚠ WS send error: {e}")
 
-def momentum_slope():
-    if len(tick_buffer) < 5:
-        return 0
-    y = np.array(list(tick_buffer)[-5:])
-    x = np.arange(len(y))
-    return np.polyfit(x, y, 1)[0]
+def log_trade(timestamp, direction, stake, grade, profit):
+    if not os.path.exists(TRADE_LOG):
+        with open(TRADE_LOG,"w",newline="") as f:
+            csv.writer(f).writerow(["timestamp","direction","stake","grade","profit"])
+    with open(TRADE_LOG,"a",newline="") as f:
+        csv.writer(f).writerow([timestamp,direction,stake,grade,profit])
 
-def calculate_dynamic_stake(conf):
-    return max(BASE_STAKE, min(BASE_STAKE + conf * BALANCE * 0.02, MAX_STAKE))
+def ema(series,length):
+    return series.ewm(span=length).mean()
 
-def session_loss_check():
-    if MAX_BALANCE==0:
-        return True
-    return (MAX_BALANCE - BALANCE)/MAX_BALANCE < MAX_DD
+# ================= QUANT LOGIC =================
+def quant_distribution_factor(window=30):
+    if len(tick_history)<window: return 1.0
+    recent = np.array(list(tick_history)[-window:])
+    mean,std = recent.mean(), recent.std()
+    z = (recent[-1]-mean)/(std+1e-8)
+    return np.clip(1+np.tanh(z),0.5,2.0)
 
-def regime_penalty(regime):
-    return 1 + LOSS_STREAKS.get(regime,0)*0.7
+def quant_trend_strength(window=15):
+    if len(tick_history)<window: return 0.0
+    recent = np.array(list(tick_history)[-window:])
+    x = np.arange(len(recent))
+    slope = np.polyfit(x,recent,1)[0]
+    std = np.std(recent)
+    return slope/(std+1e-8)
 
-# ================= REGIME DETECTION =================
-def detect_market_regime():
-    if len(tick_buffer)<EMA_SLOW or len(tick_history)<MICRO_SLICE:
-        return "idle", 0.0
+def numeric_trade_grade():
+    if len(tick_history)<MIN_TICKS: return 0.0
+    df = pd.DataFrame({"c": list(tick_history)})
+    df["ema_f"] = ema(df["c"], EMA_FAST_BASE)
+    df["ema_s"] = ema(df["c"], EMA_SLOW_BASE)
+    df["ema_c"] = ema(df["c"], EMA_CONF)
 
-    prices = np.array(list(tick_buffer))
-    vol = prices.std()
-    ef = calculate_ema(prices, EMA_FAST)
-    es = calculate_ema(prices, EMA_SLOW)
+    trend_score = quant_trend_strength()
+    ema_score = (df["ema_f"].iloc[-1]-df["ema_s"].iloc[-1])/(df["c"].mean()+1e-8)
+    quant_factor = quant_distribution_factor()
+    momentum = (df["c"].iloc[-1]-df["c"].iloc[-2])/(df["c"].iloc[-2]+1e-8)
 
-    if ef is None or es is None:
-        return "idle", 0.0
+    grade = trend_score*0.45 + ema_score*0.3 + (quant_factor-1)*0.15 + momentum*0.1
 
-    diff = abs(ef-es)
+    recent_vol = np.std(df["c"].iloc[-20:])
+    dynamic_threshold = GRADE_THRESHOLD_BASE*(1+recent_vol*2)
 
-    if vol>=VOLATILITY_THRESHOLD and diff>vol*0.3:
-        regime, conf = "trend", min(1.0,diff/vol)
-    elif vol<VOLATILITY_THRESHOLD*0.7:
-        regime, conf = "compression", min(1.0,(VOLATILITY_THRESHOLD-vol)/VOLATILITY_THRESHOLD)
-    else:
-        regime, conf = "idle",0.0
+    long_trend = df["ema_c"].iloc[-1]-df["ema_c"].iloc[-5]
+    if (grade>0 and long_trend<0) or (grade<0 and long_trend>0): return 0.0
+    if abs(trend_score)<TREND_MIN: return 0.0
+    z = (df["c"].iloc[-1]-df["c"].mean())/(df["c"].std()+1e-8)
+    if abs(z)>2.0: return 0.0
+    return grade if abs(grade)>dynamic_threshold else 0.0
 
-    regime_buffer.append(regime)
-    if len(regime_buffer)==REGIME_CONFIRM_TICKS and len(set(regime_buffer))==1:
-        return regime, conf
-    return "idle",0.0
+def calculate_trade_amount(grade):
+    if len(tick_history)<10: return BASE_STAKE
+    recent = np.array(list(tick_history)[-20:])
+    vol = np.std(recent)/np.mean(recent)
+    stake = BASE_STAKE*(0.05/max(vol,0.01))
+    stake = min(stake, MAX_STAKE, BALANCE*TRADE_RISK_FRAC)
+    stake *= quant_distribution_factor()
+    stake *= min(abs(grade)*3,3.0)
+    return max(stake, BASE_STAKE)
 
-# ================= STRATEGIES =================
-def momentum_strategy(conf):
-    ef = calculate_ema(list(tick_buffer), EMA_FAST)
-    es = calculate_ema(list(tick_buffer), EMA_SLOW)
-    slope = momentum_slope()
-    if ef>es and slope>0: return "up", conf
-    if ef<es and slope<0: return "down", conf
-    return None, 0
-
-def compression_breakout_strategy(conf):
-    r = np.array(list(tick_buffer))
-    hi, lo = r.max(), r.min()
-    rng = hi-lo
-    if rng<0.0015: return None,0
-    if r[-1]>=hi-0.15*rng: return "up", conf
-    if r[-1]<=lo+0.15*rng: return "down", conf
-    return None,0
-
-# ================= TRADE ENGINE =================
 def evaluate_and_trade():
-    global last_proposal_time, CURRENT_REGIME, TRADE_AMOUNT
+    global last_proposal_time, TRADE_AMOUNT, last_trade_time
+    now = time.time()
+    if now-last_proposal_time<PROPOSAL_COOLDOWN: return
+    if now-last_trade_time<MIN_TRADE_INTERVAL: return
+    if len(tick_history)<MIN_TICKS: return
 
-    regime, conf = detect_market_regime()
-    if regime=="idle" or conf<0.5:
-        return
+    grade = numeric_trade_grade()
+    direction = "RISE" if grade>0 else "FALL"
 
-    cooldown = PROPOSAL_COOLDOWN*regime_penalty(regime)
-    if time.time()-last_proposal_time<cooldown:
-        return
+    if grade==0 and now-last_trade_time>LOW_CONF_WAIT:
+        grade = 0.01
+        TRADE_AMOUNT = BASE_STAKE
+        append_alert("⚡ Low-confidence fire mode triggered!")
 
-    if not session_loss_check():
-        log("⚠ MAX DRAWDOWN HIT")
-        return
-
-    if regime=="trend":
-        direction, conf = momentum_strategy(conf)
+    if grade!=0:
+        TRADE_AMOUNT = calculate_trade_amount(grade)
+        TRADE_AMOUNT = max(TRADE_AMOUNT, BASE_STAKE)
+        trade_queue.append((direction, grade, TRADE_AMOUNT))
+        last_proposal_time = now
+        process_trade_queue()
     else:
-        direction, conf = compression_breakout_strategy(conf)
-
-    if direction is None:
-        return
-
-    TRADE_AMOUNT = calculate_dynamic_stake(conf)
-    split = TRADE_AMOUNT/MULTI_CONTRACTS
-
-    for _ in range(MULTI_CONTRACTS):
-        trade_queue.append((direction,1,split))
-
-    CURRENT_REGIME = regime
-    last_proposal_time=time.time()
-    log(f"{regime.upper()} → {direction.upper()} | Stake {TRADE_AMOUNT:.2f}")
-    process_trade_queue()
+        append_alert("⚠ Skipping weak trade grade")
 
 def process_trade_queue():
-    global trade_in_progress
-    while trade_queue and not trade_in_progress:
-        direction,duration,stake=trade_queue.popleft()
-        ct="CALL" if direction=="up" else "PUT"
-        ws.send(json.dumps({
-            "proposal":1,
-            "amount":stake,
-            "basis":"stake",
-            "contract_type":ct,
-            "currency":"USD",
-            "duration":duration,
-            "duration_unit":"t",
-            "symbol":SYMBOL
-        }))
-        trade_in_progress=True
-        log(f"🚀 Trade sent: {ct} | Stake: {stake}")
+    global next_trade_signal, trade_in_progress
+    if trade_queue and not trade_in_progress:
+        direction, grade, stake = trade_queue.popleft()
+        next_trade_signal = direction
+        request_proposal(next_trade_signal, grade, stake)
 
-# ================= CONTRACT MANAGEMENT =================
-def manage_contract(c):
-    cid=c["contract_id"]
-    if cid not in OPEN_CONTRACTS:
-        OPEN_CONTRACTS[cid]={"entry":c["buy_price"],"peak":0,"partial":False}
+def request_proposal(direction, grade, stake):
+    global trade_in_progress, TRADE_AMOUNT, last_trade_time
+    ct = "CALL" if direction=="RISE" else "PUT"
+    proposal = {
+        "proposal":1,
+        "amount":stake,
+        "basis":"stake",
+        "contract_type":ct,
+        "currency":"USD",
+        "duration":2,
+        "duration_unit":"t",
+        "symbol":SYMBOL
+    }
+    trade_in_progress=True
+    last_trade_time=time.time()
+    append_alert(f"📨 Proposal → {direction} | Stake {stake:.2f} | Grade {grade:.4f}")
+    safe_ws_send(proposal)
 
-    trade=OPEN_CONTRACTS[cid]
-    profit=float(c.get("profit") or 0)
-    stake=float(c["buy_price"])
-    pnl=profit/stake
-    trade["peak"]=max(trade["peak"], pnl)
-
-    if pnl<=-0.35:
-        ws.send(json.dumps({"sell":cid,"price":0}))
-        log("❌ VIRTUAL SL")
-    if pnl>=0.25 and not trade["partial"]:
-        ws.send(json.dumps({"sell":cid,"price":c["bid_price"]}))
-        trade["partial"]=True
-        log("✅ PARTIAL TP")
-    if trade["peak"]>=0.3 and pnl<=trade["peak"]-0.15:
-        ws.send(json.dumps({"sell":cid,"price":0}))
-        log("🔒 TRAIL STOP")
-
-def on_contract_settlement(c):
-    global BALANCE, MAX_BALANCE, WINS, LOSSES, trade_in_progress
-    profit=float(c.get("profit") or 0)
-    BALANCE+=profit
-    MAX_BALANCE=max(MAX_BALANCE,BALANCE)
-    if profit>0:
-        WINS+=1
-        LOSS_STREAKS[CURRENT_REGIME]=0
-    else:
-        LOSSES+=1
-        LOSS_STREAKS[CURRENT_REGIME]+=1
-    OPEN_CONTRACTS.pop(c["contract_id"],None)
+def on_contract_settlement(contract):
+    global BALANCE, WINS, LOSSES, TRADE_AMOUNT, TRADE_COUNT, trade_in_progress
+    profit = float(contract.get("profit") or 0)
+    BALANCE += profit
+    equity_curve.append(BALANCE)
+    if profit>0: WINS+=1
+    else: LOSSES+=1
+    TRADE_COUNT+=1
+    append_alert(f"✔ Settlement: {profit:.2f} | Next Stake {TRADE_AMOUNT:.2f}")
+    log_trade(time.strftime("%Y-%m-%d %H:%M:%S"), next_trade_signal, TRADE_AMOUNT, 0, profit)
     trade_in_progress=False
     process_trade_queue()
 
 # ================= WEBSOCKET =================
-def on_message(wsapp,msg):
-    json_logs.appendleft(msg[:160])
-    data=json.loads(msg)
-
-    if "authorize" in data:
-        ws.send(json.dumps({"ticks":SYMBOL,"subscribe":1}))
-        ws.send(json.dumps({"balance":1,"subscribe":1}))
-        ws.send(json.dumps({"proposal_open_contract":1,"subscribe":1}))
-        log("🔑 AUTHORIZED")
-
-    if "tick" in data:
-        price=float(data["tick"]["quote"])
-        tick_history.append(price)
-        tick_buffer.append(price)
-        evaluate_and_trade()
-
-    if "proposal" in data:
-        time.sleep(PROPOSAL_DELAY)
-        ws.send(json.dumps({"buy":data["proposal"]["id"],"price":data["proposal"]["ask_price"]}))
-
-    if "proposal_open_contract" in data:
-        c=data["proposal_open_contract"]
-        if not c.get("is_sold"):
-            manage_contract(c)
-        else:
-            on_contract_settlement(c)
-
-    if "balance" in data:
-        global BALANCE
-        BALANCE=float(data["balance"]["balance"])
-
-def on_open(wsapp):
-    log("CONNECTED & AUTHORIZED")
-    wsapp.send(json.dumps({"authorize":API_TOKEN}))
-
-def on_error(wsapp,error):
-    log(f"WS ERROR: {error}")
-
-def on_close(wsapp, close_status_code, close_msg):
-    log(f"WS CLOSED | code={close_status_code} msg={close_msg}")
-    reconnect_ws()
-
-def reconnect_ws():
-    log("🔄 Attempting WS reconnect in 5s...")
-    time.sleep(5)
-    start_ws()
+def on_message(ws_obj, msg):
+    global BALANCE, authorized
+    try:
+        data = json.loads(msg)
+        if "authorize" in data:
+            authorized=True
+            safe_ws_send({"ticks":SYMBOL,"subscribe":1})
+            safe_ws_send({"balance":1,"subscribe":1})
+            safe_ws_send({"proposal_open_contract":1,"subscribe":1})
+            append_alert("✔ Authorized")
+        if "tick" in data:
+            tick = float(data["tick"]["quote"])
+            tick_history.append(tick)
+            evaluate_and_trade()
+        if "balance" in data:
+            BALANCE=float(data["balance"]["balance"])
+            equity_curve.append(BALANCE)
+        if "proposal" in data:
+            pid = data["proposal"]["id"]
+            time.sleep(0.01)
+            safe_ws_send({"buy":pid,"price":TRADE_AMOUNT})
+            active_trades.append(pid)
+            append_alert("✔ BUY sent")
+        if "proposal_open_contract" in data:
+            c = data["proposal_open_contract"]
+            if c.get("is_sold") or c.get("is_expired"):
+                on_contract_settlement(c)
+                active_trades[:] = [t for t in active_trades if t != c.get("id")]
+    except Exception as e:
+        append_alert(f"⚠ WS Handler Error: {e}")
 
 def start_ws():
-    global ws
-    ws = websocket.WebSocketApp(
-        DERIV_WS,
-        on_open=on_open,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close
-    )
-    threading.Thread(target=ws.run_forever, daemon=True).start()
+    global ws, ws_running
+    if ws_running: return
+    ws_running=True
+    def run_ws():
+        global ws
+        while True:
+            try:
+                ws = websocket.WebSocketApp(
+                    DERIV_WS,
+                    on_open=lambda ws_obj: safe_ws_send({"authorize":API_TOKEN}),
+                    on_message=on_message,
+                    on_error=lambda ws_obj, err: append_alert(f"❌ WS Error: {err}"),
+                    on_close=lambda *args: append_alert("❌ WS Closed")
+                )
+                ws.run_forever()
+            except Exception as e:
+                append_alert(f"⚠ WS reconnect error: {e}")
+                time.sleep(2)
+    threading.Thread(target=run_ws, daemon=True).start()
 
-# ================= HEARTBEAT =================
+def keep_alive():
+    while True:
+        time.sleep(15)
+        safe_ws_send({"ping":1})
+
+def auto_unfreeze():
+    global trade_in_progress, last_trade_time
+    while True:
+        time.sleep(1)
+        if trade_in_progress and time.time()-last_trade_time>5:
+            trade_in_progress=False
+            append_alert("⚠ Auto-unfreeze: Trade reset")
+            process_trade_queue()
+
 def heartbeat():
     while True:
-        log(f"❤️ BAL={BALANCE:.2f} W={WINS} L={LOSSES} OPEN={len(OPEN_CONTRACTS)}")
+        append_alert(f"❤️ BAL={BALANCE:.2f} W={WINS} L={LOSSES} OPEN={len(active_trades)}")
         time.sleep(30)
 
 # ================= START =================
-if __name__=="__main__":
-    log("🚀 MULTI-CONTRACT ALPHA BOT — KOYEB READY")
-    threading.Thread(target=heartbeat, daemon=True).start()
+def start():
     start_ws()
+    threading.Thread(target=keep_alive, daemon=True).start()
+    threading.Thread(target=auto_unfreeze, daemon=True).start()
+    threading.Thread(target=heartbeat, daemon=True).start()
     while True:
         time.sleep(1)
+
+if __name__=="__main__":
+    append_alert("🚀 QUANT ALPHA BOT — KOYEB READY")
+    start()
