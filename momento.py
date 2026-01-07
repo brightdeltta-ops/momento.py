@@ -1,5 +1,5 @@
 # =====================================
-# MOMENTO — MONTE CARLO ALPHA (KOYEB FIXED)
+# MOMENTO — MONTE CARLO ALPHA (KOYEB PROD)
 # =====================================
 
 import os, json, time, threading, websocket
@@ -16,7 +16,7 @@ BASE_STAKE = float(os.getenv("BASE_STAKE", "100"))
 # ============== PARAMETERS ===========
 EMA_FAST = 5
 EMA_SLOW = 21
-WINDOW = 30
+WINDOW = 40
 
 CONF_THRESHOLD = 0.25
 COOLDOWN = 2.0
@@ -29,6 +29,7 @@ wins = 0
 losses = 0
 edge = 0.0
 last_trade_ts = 0.0
+trade_in_progress = False
 ws = None
 
 # ============== UTILS =================
@@ -49,7 +50,7 @@ def detect_signal():
     if len(ticks) < EMA_SLOW:
         return None, 0.0
 
-    prices = list(ticks)  # 🔑 FIX: convert deque → list
+    prices = list(ticks)  # 🔑 deque → list (critical fix)
 
     ef = ema_from_list(prices[-EMA_FAST:], EMA_FAST)
     es = ema_from_list(prices[-EMA_SLOW:], EMA_SLOW)
@@ -68,7 +69,10 @@ def detect_signal():
     return direction, confidence
 
 def maybe_trade():
-    global last_trade_ts
+    global last_trade_ts, trade_in_progress
+
+    if trade_in_progress:
+        return
 
     now = time.time()
     if now - last_trade_ts < COOLDOWN:
@@ -79,39 +83,49 @@ def maybe_trade():
         return
 
     stake = round(BASE_STAKE * (1 + edge), 2)
-    send_trade(direction, stake)
+    request_proposal(direction, stake)
     last_trade_ts = now
+    trade_in_progress = True
 
-def send_trade(direction, stake):
-    log(f"🔥 TRADE {direction} | stake={stake}")
-
+def request_proposal(direction, stake):
+    log(f"📨 PROPOSAL {direction} | stake={stake}")
     ws.send(json.dumps({
-        "buy": 1,
-        "price": stake,
-        "parameters": {
-            "amount": stake,
-            "basis": "stake",
-            "contract_type": direction,
-            "currency": "USD",
-            "duration": 1,
-            "duration_unit": "t",
-            "symbol": SYMBOL
-        }
+        "proposal": 1,
+        "amount": stake,
+        "basis": "stake",
+        "contract_type": direction,
+        "currency": "USD",
+        "duration": 1,
+        "duration_unit": "t",
+        "symbol": SYMBOL
     }))
 
 # ============== WS HANDLERS ===========
 def on_message(wsapp, message):
-    global balance, wins, losses, edge
+    global balance, wins, losses, edge, trade_in_progress
 
     data = json.loads(message)
 
-    if "tick" in data:
+    if "authorize" in data:
+        log("AUTHORIZED")
+        wsapp.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
+        wsapp.send(json.dumps({"balance": 1, "subscribe": 1}))
+        wsapp.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
+
+    elif "tick" in data:
         price = float(data["tick"]["quote"])
         ticks.append(price)
         maybe_trade()
 
     elif "balance" in data:
         balance = float(data["balance"]["balance"])
+
+    elif "proposal" in data:
+        pid = data["proposal"]["id"]
+        wsapp.send(json.dumps({
+            "buy": pid,
+            "price": data["proposal"]["ask_price"]
+        }))
 
     elif "proposal_open_contract" in data:
         poc = data["proposal_open_contract"]
@@ -123,19 +137,18 @@ def on_message(wsapp, message):
             else:
                 losses += 1
                 edge = max(0.0, edge - 0.02)
+            trade_in_progress = False
 
 def on_open(wsapp):
-    log("AUTHORIZED")
     wsapp.send(json.dumps({"authorize": API_TOKEN}))
-    wsapp.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
-    wsapp.send(json.dumps({"balance": 1, "subscribe": 1}))
-    wsapp.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
 
 def on_error(wsapp, error):
     log(f"ERROR {error}")
 
 def on_close(wsapp):
-    log("WS CLOSED")
+    log("WS CLOSED — reconnecting in 3s")
+    time.sleep(3)
+    start_ws()
 
 # ============== HEARTBEAT ============
 def heartbeat():
@@ -143,12 +156,9 @@ def heartbeat():
         log(f"❤️ BAL={balance:.2f} W={wins} L={losses} EDGE={edge:.2f}")
         time.sleep(30)
 
-# ============== MAIN ==================
-if __name__ == "__main__":
-    log("🚀 MONTE-CARLO ALPHA BOT — KOYEB READY (FIXED)")
-
-    threading.Thread(target=heartbeat, daemon=True).start()
-
+# ============== WS START =============
+def start_ws():
+    global ws
     ws = websocket.WebSocketApp(
         f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}",
         on_open=on_open,
@@ -156,5 +166,10 @@ if __name__ == "__main__":
         on_error=on_error,
         on_close=on_close
     )
-
     ws.run_forever(ping_interval=20, ping_timeout=10)
+
+# ============== MAIN ==================
+if __name__ == "__main__":
+    log("🚀 MOMENTO — MONTE CARLO ALPHA BOT (PRODUCTION)")
+    threading.Thread(target=heartbeat, daemon=True).start()
+    start_ws()
