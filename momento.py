@@ -1,137 +1,244 @@
-import os
-import json
-import time
-import websocket
+import os, json, threading, time, signal
 from collections import deque
-from datetime import datetime
+import websocket
+import pandas as pd
+import numpy as np
 
-# ================== CONFIG ==================
-API_TOKEN = os.getenv("DERIV_API_TOKEN")  # Deriv API token
-APP_ID = int(os.getenv("APP_ID", "0"))    # Deriv app ID
-SYMBOL = "frxUSDJPY"                      # USD/JPY Deriv symbol
+# -------------------------
+# CONFIG
+# -------------------------
+DERIV_TOKEN = os.getenv("DERIV_API_TOKEN")  # Must be set in Koyeb environment
+APP_ID = int(os.getenv("APP_ID", 1089))
+SYMBOL = "R_75"
+INITIAL_BALANCE = 100.0
+RISK_PER_TRADE = 0.02
+MAX_OPEN_TRADES = 2
+MAX_CONSECUTIVE_LOSSES = 3
+CCI_SHORT = 14
+AGGRESSION = "MEDIUM"
+ENTRY_COOLDOWN = 30
+SLIPPAGE = 0.0001
 
-# Risk management
-MAX_OPEN_TRADES = 3
-STAKE_PER_TRADE = 1.0       # base stake per trade
-DAILY_DRAWDOWN_LIMIT = 200  # optional
+# -------------------------
+# STATE
+# -------------------------
+balance = INITIAL_BALANCE
+wins = 0
+losses = 0
+consecutive_losses = 0
+open_trades = []  # track live trade IDs
+last_entry_time = 0
+shutdown_event = threading.Event()
+alerts = deque(maxlen=20)
+ticks = deque(maxlen=2000)
+symbol_last_entry = {}
+trade_in_progress = False
+TRADE_AMOUNT = 0.0
+ws = None
+lock = threading.Lock()
 
-# Ultra Elite EMA-Fractal setups
-ULTRA_ELITE_SETUPS = [
-    {"id": 1, "ema_short": 5, "ema_long": 20, "fractal_lookback": 3, "threshold": 0.5},
-    {"id": 2, "ema_short": 10, "ema_long": 50, "fractal_lookback": 5, "threshold": 0.8},
-    {"id": 3, "ema_short": 8, "ema_long": 30, "fractal_lookback": 4, "threshold": 0.6},
-    {"id": 4, "ema_short": 12, "ema_long": 60, "fractal_lookback": 6, "threshold": 1.0},
-    {"id": 5, "ema_short": 7, "ema_long": 25, "fractal_lookback": 3, "threshold": 0.7},
-    {"id": 6, "ema_short": 9, "ema_long": 40, "fractal_lookback": 4, "threshold": 0.5},
-    {"id": 7, "ema_short": 15, "ema_long": 50, "fractal_lookback": 5, "threshold": 0.9},
-    {"id": 8, "ema_short": 6, "ema_long": 20, "fractal_lookback": 3, "threshold": 0.4},
-    {"id": 9, "ema_short": 11, "ema_long": 45, "fractal_lookback": 4, "threshold": 0.6},
-    {"id": 10,"ema_short": 5, "ema_long": 15, "fractal_lookback": 3, "threshold": 0.3},
-]
+# -------------------------
+# SIGNAL HANDLER
+# -------------------------
+def append_alert(msg):
+    with lock:
+        alerts.appendleft(f"{time.strftime('%H:%M:%S')} {msg}")
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
-# ================== DATA STORAGE ==================
-price_history = deque(maxlen=200)
-open_trades = []
+def handle_sigterm(signum, frame):
+    append_alert("Shutdown signal received — exiting...")
+    shutdown_event.set()
 
-# ================== UTILITY FUNCTIONS ==================
-def calculate_ema(prices, length):
-    """Simple EMA calculation"""
-    if len(prices) < length:
-        return None
-    prices_list = list(prices)
-    return sum(prices_list[-length:]) / length
+signal.signal(signal.SIGINT, handle_sigterm)
+signal.signal(signal.SIGTERM, handle_sigterm)
 
-def detect_fractal(prices, lookback, threshold):
-    """Detect fractal breakouts using list slicing"""
-    prices_list = list(prices)
-    if len(prices_list) < lookback * 2 + 1:
-        return None
+# -------------------------
+# INDICATORS
+# -------------------------
+def ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
 
-    center = prices_list[-lookback-1]
-    left = prices_list[-lookback*2-1:-lookback-1]
-    right = prices_list[-lookback:]
-    
-    if center > max(left + right) + threshold:
-        return "up"
-    elif center < min(left + right) - threshold:
-        return "down"
-    return None
+def atr_value(df, period=14):
+    if len(df) < period + 2:
+        return max(0.0005, float(df['Close'].pct_change().rolling(5).std().iloc[-1] or 0.001))
+    rng = df['Close'].rolling(period).max() - df['Close'].rolling(period).min()
+    val = float(rng.iloc[-1]) if not rng.empty and not np.isnan(rng.iloc[-1]) else 0.001
+    return max(0.0005, val)
 
-def log_trade(setup_id, direction, price, stake):
-    """Log trade info"""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] Trade | Setup {setup_id} | {direction.upper()} | Price={price} | Stake={stake}")
+def cci(df, period):
+    tp = df['Close']
+    ma = tp.rolling(period).mean()
+    md = tp.rolling(period).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
+    c = (tp - ma) / (0.015 * md)
+    c.fillna(0, inplace=True)
+    return c
 
-# ================== TRADING LOGIC ==================
-def check_setups():
-    """Evaluate all 10 Ultra Elite setups"""
-    for setup in ULTRA_ELITE_SETUPS:
-        ema_short = calculate_ema(price_history, setup["ema_short"])
-        ema_long = calculate_ema(price_history, setup["ema_long"])
-        if ema_short is None or ema_long is None:
-            continue
+def compute_adx(df, period=14):
+    if len(df) < period + 2: return 25.0
+    h = df['Close'].rolling(2).max()
+    l = df['Close'].rolling(2).min()
+    tr = (h - l).abs()
+    tr14 = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus = df['Close'].diff().clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    minus = (-df['Close'].diff()).clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    plus_di = 100 * (plus / tr14)
+    minus_di = 100 * (minus / tr14)
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)) * 100
+    adx = dx.ewm(alpha=1/period, adjust=False).mean().iloc[-1]
+    return float(adx if not np.isnan(adx) else 25.0)
 
-        fractal_signal = detect_fractal(price_history, setup["fractal_lookback"], setup["threshold"])
-        if fractal_signal:
-            # Only trade if EMA alignment matches
-            if fractal_signal == "up" and ema_short > ema_long:
-                execute_trade(setup["id"], "buy", STAKE_PER_TRADE)
-            elif fractal_signal == "down" and ema_short < ema_long:
-                execute_trade(setup["id"], "sell", STAKE_PER_TRADE)
+def aggression_params(agg):
+    if agg == "LOW":
+        return {"cci_short": 90, "atr_mult_tp": 2.5, "atr_mult_sl": 1.0, "pullback_pct": 0.002}
+    if agg == "HIGH":
+        return {"cci_short": 40, "atr_mult_tp": 0.9, "atr_mult_sl": 0.6, "pullback_pct": 0.01}
+    return {"cci_short": 60, "atr_mult_tp": 1.5, "atr_mult_sl": 0.8, "pullback_pct": 0.005}
 
-def execute_trade(setup_id, direction, stake):
-    """Execute trade while respecting max open trades"""
-    if len(open_trades) >= MAX_OPEN_TRADES:
-        return
+AGG = aggression_params(AGGRESSION)
 
-    trade = {"setup_id": setup_id, "direction": direction, "stake": stake, "price": price_history[-1]}
-    open_trades.append(trade)
-    log_trade(setup_id, direction, price_history[-1], stake)
+# -------------------------
+# Koyeb-ready WebSocket
+# -------------------------
+mode_live = False
+authorized = False
 
-    # Send proposal to Deriv (signal always matches trade)
-    proposal_msg = {
-        "buy" if direction == "buy" else "sell": 1,
-        "symbol": SYMBOL,
-        "amount": stake,
-        "duration": 1,
-        "duration_unit": "t"
-    }
-    ws.send(json.dumps(proposal_msg))
+def send_authorize():
+    global ws
+    ws.send(json.dumps({"authorize": DERIV_TOKEN, "app_id": APP_ID}))
 
-# ================== WEBSOCKET CALLBACKS ==================
-def on_message(ws, message):
-    data = json.loads(message)
-    if "tick" in data:
-        price = data["tick"]["quote"]
-        price_history.append(price)
-        check_setups()
+def on_message(ws, msg):
+    global balance, trade_in_progress, authorized, wins, losses, consecutive_losses
+    try:
+        data = json.loads(msg)
+        # Authorization confirmation
+        if "authorize" in data:
+            authorized = True
+            append_alert("✔ Authorized")
+            ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
+            ws.send(json.dumps({"balance": 1, "subscribe": 1}))
+            ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
+
+        # Ticks
+        if "tick" in data:
+            tick = float(data["tick"]["quote"])
+            ticks.append(tick)
+
+        # Balance update
+        if "balance" in data:
+            balance = float(data["balance"]["balance"])
+
+        # Contract settlements
+        if "proposal_open_contract" in data:
+            for c in data["proposal_open_contract"]:
+                if c.get("is_sold") or c.get("is_expired"):
+                    profit = float(c.get("profit") or 0)
+                    balance += profit
+                    if profit > 0:
+                        wins += 1
+                        consecutive_losses = 0
+                    else:
+                        losses += 1
+                        consecutive_losses += 1
+                    trade_in_progress = False
+                    append_alert(f"✔ Settlement: Profit={profit:.2f} | Balance={balance:.2f}")
+    except Exception as e:
+        append_alert(f"WS parse error: {e}")
 
 def on_error(ws, error):
-    print("WebSocket Error:", error)
+    append_alert(f"❌ WS Error: {error}")
 
-def on_close(ws, close_status_code, close_msg):
-    print("WebSocket closed. Reconnecting in 5s...")
-    time.sleep(5)
-    start_websocket()
+def on_close(ws, *_):
+    append_alert("❌ WS Closed, reconnecting in 2s")
+    time.sleep(2)
+    start_ws()
 
-def on_open(ws):
-    print("WebSocket connected. Subscribing to USD/JPY ticks...")
-    subscribe_msg = {"ticks": SYMBOL, "subscribe": 1}
-    ws.send(json.dumps(subscribe_msg))
-
-# ================== START WEBSOCKET ==================
-def start_websocket():
-    global ws
+def start_ws():
+    global ws, mode_live, authorized
     ws = websocket.WebSocketApp(
-        f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}&l=EN",
-        on_open=on_open,
+        f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}",
+        on_open=lambda ws: send_authorize(),
         on_message=on_message,
         on_error=on_error,
         on_close=on_close
     )
-    ws.run_forever()
+    threading.Thread(target=ws.run_forever, daemon=True).start()
+    mode_live = True
 
-# ================== MAIN ==================
-if __name__ == "__main__":
-    print("Starting Ultra Elite USD/JPY Bot...")
-    start_websocket()
+# -------------------------
+# TRADE ENGINE
+# -------------------------
+def can_enter_now():
+    now = time.time()
+    last = symbol_last_entry.get(SYMBOL, 0)
+    return now - last > ENTRY_COOLDOWN
+
+def place_trade(direction, stake):
+    global trade_in_progress, TRADE_AMOUNT
+    if not authorized or trade_in_progress or len(open_trades) >= MAX_OPEN_TRADES:
+        return
+    TRADE_AMOUNT = stake
+    ct = "CALL" if direction == "BULL" else "PUT"
+    proposal = {
+        "proposal": 1,
+        "amount": TRADE_AMOUNT,
+        "basis": "stake",
+        "contract_type": ct,
+        "currency": "USD",
+        "duration": 1,
+        "duration_unit": "t",
+        "symbol": SYMBOL
+    }
+    try:
+        ws.send(json.dumps(proposal))
+        trade_in_progress = True
+        symbol_last_entry[SYMBOL] = time.time()
+        append_alert(f"📈 Trade sent → {direction} | Stake={TRADE_AMOUNT:.2f}")
+    except Exception as e:
+        append_alert(f"⚠ Trade send failed: {e}")
+
+def trade_engine():
+    global balance, wins, losses, consecutive_losses
+    while not shutdown_event.is_set():
+        if len(ticks) < 25 or not authorized:
+            time.sleep(0.5)
+            continue
+
+        prices = pd.Series(list(ticks))
+        df = pd.DataFrame({"Close": prices})
+        df["EMA50"] = ema(df["Close"], 50)
+        df["EMA200"] = ema(df["Close"], 200)
+        df["CCI14"] = cci(df, CCI_SHORT)
+        adx_val = compute_adx(df)
+
+        last_close = df["Close"].iloc[-1]
+        ema200 = df["EMA200"].iloc[-1]
+        ema50 = df["EMA50"].iloc[-1]
+        cci_short = df["CCI14"].iloc[-1]
+        atr = atr_value(df, period=14)
+
+        trend = "BULL" if last_close > ema200 else ("BEAR" if last_close < ema200 else None)
+        params = AGG
+        cci_threshold = params["cci_short"]
+
+        if trend and can_enter_now():
+            stake = round(balance * RISK_PER_TRADE, 2)
+            if trend == "BULL" and cci_short > cci_threshold:
+                place_trade("BULL", stake)
+            elif trend == "BEAR" and cci_short < -cci_threshold:
+                place_trade("BEAR", stake)
+
+        if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+            append_alert("Max consecutive losses reached — stopping trading")
+            shutdown_event.set()
+
+        time.sleep(0.5)
+
+# -------------------------
+# START BOT
+# -------------------------
+start_ws()
+threading.Thread(target=trade_engine, daemon=True).start()
+append_alert("✅ Live Koyeb-ready EMA bot started")
+
+while not shutdown_event.is_set():
+    time.sleep(1)
