@@ -7,9 +7,8 @@ TOKEN = os.getenv("DERIV_API_TOKEN")
 APP_ID = int(os.getenv("APP_ID", "1089"))
 
 SYMBOL = "R_75"
-
 BASE_STAKE = 200.0
-TRADE_DURATION = 1  # ticks
+TRADE_DURATION = 1
 
 EMA_FAST = 9
 EMA_SLOW = 21
@@ -22,7 +21,7 @@ DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 # ================= STATE =================
 ticks = deque(maxlen=500)
-trade_queue = deque(maxlen=10)
+trade_queue = deque(maxlen=5)
 
 BALANCE = 0.0
 WINS = LOSSES = TRADES = 0
@@ -38,23 +37,23 @@ def log(msg):
     print(time.strftime("%H:%M:%S"), msg, flush=True)
 
 # ================= INDICATORS =================
-def ema(data, period):
-    if len(data) < period:
+def ema_from_list(prices, period):
+    if len(prices) < period:
         return None
     k = 2 / (period + 1)
-    val = data[-period]
-    for p in data[-period+1:]:
-        val = p * k + val * (1 - k)
-    return val
+    ema_val = prices[-period]
+    for p in prices[-period + 1:]:
+        ema_val = p * k + ema_val * (1 - k)
+    return ema_val
 
-def micro_fractal():
-    if len(ticks) < FRACTAL_LOOKBACK + 2:
+def micro_fractal(prices):
+    if len(prices) < FRACTAL_LOOKBACK + 2:
         return None
 
-    recent = list(ticks)[-FRACTAL_LOOKBACK-2:-2]
+    recent = prices[-FRACTAL_LOOKBACK-2:-2]
     hi = max(recent)
     lo = min(recent)
-    last = ticks[-1]
+    last = prices[-1]
 
     if last > hi:
         return "up"
@@ -63,15 +62,16 @@ def micro_fractal():
     return None
 
 def trade_signal():
-    if len(ticks) < EMA_SLOW + 5:
+    prices = list(ticks)
+    if len(prices) < EMA_SLOW + 5:
         return None
 
-    ef = ema(ticks, EMA_FAST)
-    es = ema(ticks, EMA_SLOW)
-    fractal = micro_fractal()
-    price = ticks[-1]
+    ef = ema_from_list(prices, EMA_FAST)
+    es = ema_from_list(prices, EMA_SLOW)
+    fractal = micro_fractal(prices)
+    price = prices[-1]
 
-    if not fractal or ef is None or es is None:
+    if ef is None or es is None or not fractal:
         return None
 
     if fractal == "up" and ef > es and price > ef:
@@ -198,7 +198,7 @@ def start_ws():
     )
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
-log("🚀 FRACTAL EMA BOT — KOYEB READY")
+log("🚀 FRACTAL EMA BOT — KOYEB STABLE")
 start_ws()
 threading.Thread(target=auto_unfreeze, daemon=True).start()
 
