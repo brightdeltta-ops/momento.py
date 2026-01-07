@@ -1,207 +1,257 @@
-import os, json, time, threading, websocket
-import numpy as np
+import json, threading, time, websocket
 from collections import deque
+import numpy as np
+import os
+import sys
 
-# ================= CONFIG =================
-API_TOKEN = os.getenv("DERIV_API_TOKEN")
-APP_ID = int(os.getenv("APP_ID", "112380"))
-
+# ================================
+# CONFIG
+# ================================
+API_TOKEN = os.getenv("DERIV_API_TOKEN", "eZjDrK54yMTAsbf")
+APP_ID = int(os.getenv("APP_ID", 112380))
 SYMBOL = "R_75"
 
 BASE_STAKE = 1.0
 MAX_STAKE = 100.0
-RISK_FRAC = 0.03
-MAX_MARTI = 4
+MARTI_MULTIPLIER = 1.7
+MAX_MARTI_STEPS = 5
+SAFE_ACCOUNT_RISK = 0.05
+MAX_SESSION_LOSS = 20
 
-EMA_FAST = 3
-EMA_MED = 6
-EMA_SLOW = 12
-
-MIN_CONF = 0.65
-PROPOSAL_COOLDOWN = 1.2
+TRADE_AMOUNT = BASE_STAKE
+EMA_FAST, EMA_MEDIUM, EMA_SLOW = 2, 4, 8
+TIMEFRAMES = [1, 5, 15]
+FRACTAL_LENGTH = 2
+MICRO_TICKS = 3
+PROPOSAL_COOLDOWN = 0.02  # ultra-HF
 
 DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
-# ================= STATE =================
-ticks = deque(maxlen=500)
-trade_queue = deque(maxlen=20)
-bias_memory = deque(maxlen=200)
+# ================================
+# STATE
+# ================================
+tick_history = deque(maxlen=1000)
+alerts = deque(maxlen=50)
+equity_curve = []
 
 BALANCE = 0.0
-WINS = LOSSES = TRADES = 0
+WINS = 0
+LOSSES = 0
+TRADES = 0
 
-ema_fast = ema_med = ema_slow = 0.0
-marti_step = 0
-current_stake = BASE_STAKE
+trade_queue = deque(maxlen=20)
+trade_memory = deque(maxlen=400)
+bias_memory = deque(maxlen=400)
 
 trade_in_progress = False
+current_trade_amount = TRADE_AMOUNT
+current_marti_step = 0
 last_trade_time = 0
 last_proposal_time = 0
+next_trade_signal = None
 
+ema_fast_val = 0
+ema_medium_val = 0
+ema_slow_val = 0
+
+BAR_HISTORY = {tf: deque(maxlen=100) for tf in TIMEFRAMES}
 ws = None
 lock = threading.Lock()
 
-# ================= UTIL =================
-def log(msg):
-    with lock:
-        print(msg, flush=True)
+tick_counter = 0
+FAST_RETRAIN_INTERVAL = 10
 
-def ema(prev, price, period):
-    alpha = 2 / (period + 1)
+# ================================
+# UTILITIES
+# ================================
+def append_alert(msg):
+    with lock:
+        alerts.appendleft(msg)
+    print(msg)
+
+def calc_ema(prev, price, p):
+    alpha = 2 / (p + 1)
     return price if prev == 0 else prev * (1 - alpha) + price * alpha
 
-# ================= MARKET INTELLIGENCE =================
-def trend_direction():
-    if ema_fast > ema_med > ema_slow:
-        return "UP"
-    if ema_fast < ema_med < ema_slow:
-        return "DOWN"
+# ================================
+# TREND DETECTION
+# ================================
+def aggregate_bars():
+    if len(tick_history) < max(TIMEFRAMES): return
+    now = time.time()
+    for tf in TIMEFRAMES:
+        last_bar = BAR_HISTORY[tf][-1][0] if BAR_HISTORY[tf] else None
+        tf_ticks = list(tick_history)[-tf:]
+        if tf_ticks:
+            avg_price = sum(tf_ticks) / len(tf_ticks)
+            if not last_bar or avg_price != last_bar:
+                BAR_HISTORY[tf].append((avg_price, now))
+
+def detect_fractal_tf(bar_deque):
+    if len(bar_deque) < FRACTAL_LENGTH: return None
+    for i in range(1, len(bar_deque) - 1):
+        middle = bar_deque[i][0]
+        left = bar_deque[i - 1][0]
+        right = bar_deque[i + 1][0]
+        if middle < min(left, right): return "RISE"
+        elif middle > max(left, right): return "FALL"
     return None
 
-def momentum_signal():
-    if len(ticks) < 6:
-        return None, 0
-    arr = np.array(list(ticks)[-6:])
-    delta = arr[-1] - arr[0]
-    strength = min(abs(delta) / (np.std(arr) + 1e-6), 1)
-    return ("UP" if delta > 0 else "DOWN"), strength
+def detect_breakout():
+    if len(tick_history) < 5: return None
+    recent = list(tick_history)[-5:]
+    high, low = max(recent), min(recent)
+    current = recent[-1]
+    if current >= high: return "RISE"
+    elif current <= low: return "FALL"
+    return None
 
-def volatility_ok():
-    if len(ticks) < 20:
-        return False
-    return np.std(list(ticks)[-20:]) > 0.001
+def detect_trend():
+    global ema_fast_val, ema_medium_val, ema_slow_val
+    if ema_fast_val > ema_medium_val > ema_slow_val: return "RISE"
+    if ema_fast_val < ema_medium_val < ema_slow_val: return "FALL"
+    return None
 
-def adaptive_bias():
-    score = 0
-    for i, b in enumerate(reversed(bias_memory)):
-        weight = 0.95 ** i
-        score += weight if b == "UP" else -weight
-    return score
+def detect_strength():
+    if len(tick_history) < 20: return 0
+    arr = np.array(list(tick_history)[-20:])
+    d = arr[-1] - arr[0]
+    s = np.std(arr)
+    return min(abs(d) / (s if s != 0 else 1), 1)
 
-# ================= STAKE LOGIC =================
-def calc_stake(conf):
-    global marti_step
-    risk_cap = max(BALANCE * RISK_FRAC, BASE_STAKE)
-    stake = BASE_STAKE * (1.6 ** marti_step) * (1 + conf)
-    return min(stake, risk_cap, MAX_STAKE)
+# ================================
+# SAFE MARTINGALE
+# ================================
+def calculate_safe_stake(fractal_strength):
+    global current_marti_step, BALANCE
+    base = BASE_STAKE * (1 + fractal_strength * 10)
+    vol = np.std(list(tick_history)[-20:]) if len(tick_history) >= 20 else 0
+    marti_multiplier = min(MARTI_MULTIPLIER, 1 + vol * 2)
+    stake = base * (marti_multiplier ** current_marti_step)
+    max_allowed = max(BALANCE * SAFE_ACCOUNT_RISK, BASE_STAKE)
+    if stake > max_allowed:
+        stake = BASE_STAKE
+        current_marti_step = 0
+    return min(stake, MAX_STAKE)
 
-# ================= TRADE ENGINE =================
-def evaluate_trade():
-    global last_proposal_time
-
-    if trade_in_progress:
-        return
-    if time.time() - last_proposal_time < PROPOSAL_COOLDOWN:
-        return
-    if not volatility_ok():
-        return
-
-    trend = trend_direction()
-    mom_dir, mom_conf = momentum_signal()
-
-    votes = {"UP": 0, "DOWN": 0}
-    if trend:
-        votes[trend] += 0.5
-    if mom_dir:
-        votes[mom_dir] += mom_conf
-
-    bias = adaptive_bias()
-    if bias > 0:
-        votes["UP"] += min(bias, 0.4)
+def update_marti_step(profit):
+    global current_marti_step
+    if profit > 0:
+        current_marti_step = 0
     else:
-        votes["DOWN"] += min(abs(bias), 0.4)
+        current_marti_step += 1
+        if current_marti_step > MAX_MARTI_STEPS:
+            current_marti_step = 0
 
-    direction = "UP" if votes["UP"] > votes["DOWN"] else "DOWN"
-    confidence = abs(votes["UP"] - votes["DOWN"])
+# ================================
+# ENGINE PREDICTION
+# ================================
+def ultra_engine_predict():
+    direction, conf = None, 0
+    trend = detect_trend()
+    if trend: direction, conf = trend, 0.8
+    breakout = detect_breakout()
+    if breakout: direction, conf = breakout, 0.9
+    return direction, conf
 
-    if confidence < MIN_CONF:
-        return
+# ================================
+# TRADE LOGIC
+# ================================
+def session_loss_check(): return LOSSES * BASE_STAKE < MAX_SESSION_LOSS
 
-    stake = calc_stake(confidence)
-    trade_queue.append((direction, stake))
-    last_proposal_time = time.time()
+def evaluate_and_queue_trade():
+    global last_proposal_time, tick_counter
+    now = time.time()
+    if now - last_proposal_time < PROPOSAL_COOLDOWN: return
+    if not session_loss_check(): return
 
-    log(f"🚀 QUEUED {direction} | Stake {stake:.2f} | Conf {confidence:.2f}")
-    process_queue()
+    direction, conf = ultra_engine_predict()
+    if not direction: return
 
-def process_queue():
+    fractal_strength = max(list(tick_history)[-FRACTAL_LENGTH:]) - min(list(tick_history)[-FRACTAL_LENGTH:])
+    duration = 2
+    if fractal_strength > 0.01: duration = 3
+    if fractal_strength > 0.015: duration = 4
+
+    stake = calculate_safe_stake(fractal_strength)
+    trade_queue.append((direction, duration, stake))
+    last_proposal_time = now
+    append_alert(f"🚀 QUEUED {direction} | Stake {stake:.2f} | Conf {conf:.2f}")
+
+    tick_counter += 1
+    process_trade_queue()
+
+def process_trade_queue():
+    global next_trade_signal, trade_in_progress
     if trade_queue and not trade_in_progress:
-        d, s = trade_queue.popleft()
-        send_trade(d, s)
+        next_trade_signal = trade_queue.popleft()
+        direction, duration, stake = next_trade_signal
+        fire_trade(direction, duration, stake)
 
-def send_trade(direction, stake):
-    global trade_in_progress, last_trade_time, current_stake
+def fire_trade(direction, duration, stake):
+    global trade_in_progress, current_trade_amount, last_trade_time
+    if trade_in_progress: return
     trade_in_progress = True
+    current_trade_amount = stake
     last_trade_time = time.time()
-    current_stake = stake
-
-    ws.send(json.dumps({
-        "proposal": 1,
-        "amount": stake,
-        "basis": "stake",
-        "contract_type": "CALL" if direction == "UP" else "PUT",
-        "currency": "USD",
-        "duration": 1,
-        "duration_unit": "t",
+    contract = "CALL" if direction == "RISE" else "PUT"
+    proposal = {
+        "proposal": 1, "amount": stake, "basis": "stake",
+        "contract_type": contract, "currency": "USD",
+        "duration": duration, "duration_unit": "t",
         "symbol": SYMBOL
-    }))
-    log(f"📨 PROPOSAL SENT → {direction} | {stake:.2f}")
+    }
+    ws.send(json.dumps(proposal))
+    append_alert(f"📨 PROPOSAL SENT → {direction} | {stake:.2f}")
 
-# ================= SETTLEMENT =================
-def settle(contract):
-    global BALANCE, WINS, LOSSES, TRADES, marti_step, trade_in_progress
-
+def on_contract_settlement(contract):
+    global BALANCE, WINS, LOSSES, TRADE_AMOUNT, current_marti_step, TRADES, trade_in_progress
     profit = float(contract.get("profit", 0))
     BALANCE += profit
+    equity_curve.append(BALANCE)
+    direction = "RISE" if contract.get("contract_type") == "CALL" else "FALL"
+    if profit > 0: WINS += 1
+    else: LOSSES += 1
+    update_marti_step(profit)
+    TRADE_AMOUNT = max(BASE_STAKE, TRADE_AMOUNT * 0.45) if profit > 0 else min(TRADE_AMOUNT * MARTI_MULTIPLIER, MAX_STAKE)
     TRADES += 1
-
-    direction = "UP" if contract["contract_type"] == "CALL" else "DOWN"
-
-    if profit > 0:
-        WINS += 1
-        marti_step = 0
-        bias_memory.append(direction)
-    else:
-        LOSSES += 1
-        marti_step = min(marti_step + 1, MAX_MARTI)
-        bias_memory.append("DOWN" if direction == "UP" else "UP")
-
     trade_in_progress = False
-    log(f"✔ SETTLED {profit:.2f} | BAL {BALANCE:.2f}")
-    process_queue()
+    append_alert(f"✔ SETTLED {profit:.2f} | BAL {BALANCE:.2f}")
+    process_trade_queue()
 
-# ================= WEBSOCKET =================
-def on_message(ws, msg):
-    global BALANCE
+# ================================
+# WEBSOCKET
+# ================================
+def on_open(ws_conn):
+    append_alert("✔ Connected → Authorizing")
+    ws_conn.send(json.dumps({"authorize": API_TOKEN}))
+
+def on_message(ws_conn, msg):
+    global BALANCE, current_trade_amount
     data = json.loads(msg)
-
     if "authorize" in data:
-        ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
-        ws.send(json.dumps({"balance": 1, "subscribe": 1}))
-        ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
-        log("✔ AUTHORIZED")
-
+        append_alert("✔ Authorized")
+        ws_conn.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
+        ws_conn.send(json.dumps({"balance": 1, "subscribe": 1}))
+        ws_conn.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
     if "tick" in data:
-        ticks.append(float(data["tick"]["quote"]))
-        evaluate_trade()
-
+        tick_history.append(float(data["tick"]["quote"]))
+        evaluate_and_queue_trade()
     if "balance" in data:
         BALANCE = float(data["balance"]["balance"])
-
+        equity_curve.append(BALANCE)
     if "proposal" in data:
-        ws.send(json.dumps({"buy": data["proposal"]["id"], "price": current_stake}))
-
+        ws_conn.send(json.dumps({"buy": data["proposal"]["id"], "price": current_trade_amount}))
+        append_alert("💰 Contract Bought")
     if "proposal_open_contract" in data:
         c = data["proposal_open_contract"]
         if c.get("is_sold") or c.get("is_expired"):
-            settle(c)
+            on_contract_settlement(c)
 
-def on_open(ws):
-    log("🔌 CONNECTED")
-    ws.send(json.dumps({"authorize": API_TOKEN}))
+def on_error(ws_conn, err): append_alert(f"❌ ERROR: {err}")
 
-def on_close(ws, *_):
-    log("❌ DISCONNECTED → RECONNECTING")
+def on_close(ws_conn, *args):
+    append_alert("❌ Closed → Reconnecting…")
     time.sleep(2)
     start_ws()
 
@@ -211,35 +261,46 @@ def start_ws():
         DERIV_WS,
         on_open=on_open,
         on_message=on_message,
+        on_error=on_error,
         on_close=on_close
     )
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
-# ================= SAFETY =================
-def watchdog():
-    global trade_in_progress
+# ================================
+# AUTO-UNFREEZE
+# ================================
+def auto_unfreeze():
+    global trade_in_progress, last_trade_time
     while True:
         time.sleep(1)
-        if trade_in_progress and time.time() - last_trade_time > 6:
+        if trade_in_progress and time.time() - last_trade_time > 5:
             trade_in_progress = False
-            log("⚠ AUTO-UNFREEZE")
-            process_queue()
+            append_alert("⚠ AUTO-UNFREEZE triggered")
+            process_trade_queue()
 
-def ema_engine():
-    global ema_fast, ema_med, ema_slow
+# ================================
+# ENGINE LOOP
+# ================================
+def engine():
+    global ema_fast_val, ema_medium_val, ema_slow_val
     while True:
-        if ticks:
-            p = ticks[-1]
-            ema_fast = ema(ema_fast, p, EMA_FAST)
-            ema_med = ema(ema_med, p, EMA_MED)
-            ema_slow = ema(ema_slow, p, EMA_SLOW)
-        time.sleep(0.05)
+        if len(tick_history) < EMA_SLOW:
+            time.sleep(0.01)
+            continue
+        price = tick_history[-1]
+        ema_fast_val = calc_ema(ema_fast_val, price, EMA_FAST)
+        ema_medium_val = calc_ema(ema_medium_val, price, EMA_MEDIUM)
+        ema_slow_val = calc_ema(ema_slow_val, price, EMA_SLOW)
+        time.sleep(0.01)
 
-# ================= MAIN =================
+# ================================
+# MAIN
+# ================================
 if __name__ == "__main__":
-    log("🚀 MOMENTO KOYEB BOT LIVE")
+    append_alert("🚀 Bot started — Koyeb-compatible")
     start_ws()
-    threading.Thread(target=ema_engine, daemon=True).start()
-    threading.Thread(target=watchdog, daemon=True).start()
+    threading.Thread(target=engine, daemon=True).start()
+    threading.Thread(target=auto_unfreeze, daemon=True).start()
+    # Keep script alive
     while True:
-        time.sleep(60)
+        time.sleep(10)
