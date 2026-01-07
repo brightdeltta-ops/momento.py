@@ -15,8 +15,8 @@ API_TOKEN = os.getenv("DERIV_API_TOKEN")  # Must set in Koyeb env variables
 APP_ID = int(os.getenv("APP_ID", 112380))
 SYMBOL = os.getenv("SYMBOL", "R_75")
 
-BASE_STAKE = float(os.getenv("BASE_STAKE", 50))
-MAX_STAKE = float(os.getenv("MAX_STAKE", 100))
+BASE_STAKE = float(os.getenv("BASE_STAKE", 200))
+MAX_STAKE = float(os.getenv("MAX_STAKE", 1000))
 TRADE_RISK_FRAC = float(os.getenv("TRADE_RISK_FRAC", 0.02))
 
 EMA_FAST_BASE = int(os.getenv("EMA_FAST_BASE", 6))
