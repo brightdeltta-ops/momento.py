@@ -1,200 +1,210 @@
-import json, time, threading, websocket, os
-import numpy as np
+# ==========================================
+# MOMENTO — FIRING BOT + PROFIT LOCK (KOYEB)
+# ==========================================
+
+import os, json, time, threading, websocket
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
+import numpy as np
 
-# ============== ENV CONFIG ==============
+# ============== ENV ==================
 API_TOKEN = os.getenv("DERIV_API_TOKEN")
-APP_ID = os.getenv("APP_ID", "112380")
+APP_ID = int(os.getenv("APP_ID", "1089"))
 SYMBOL = os.getenv("SYMBOL", "R_75")
-
 BASE_STAKE = float(os.getenv("BASE_STAKE", "1"))
-MAX_STAKE = 100.0
-TRADE_RISK_FRAC = 0.02
 
-EMA_FAST = 3
-EMA_SLOW = 10
-MICRO_SLICE = 10
-VOL_WINDOW = 20
-VOL_THRESHOLD = 0.0015
+# ============== PARAMETERS ===========
+EMA_FAST = 5
+EMA_SLOW = 21
+WINDOW = 30
 
-PROPOSAL_COOLDOWN = 6
+CONF_THRESHOLD = 0.55
+COOLDOWN = 2.0
+MAX_EDGE = 0.25
 TRADE_TIMEOUT = 8
-MAX_DD = 0.2
 
-DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+# ---- PROFIT LOCK ----
+LOCK_TRIGGER_PCT = 0.02     # 2%
+LOCK_RATIO = 0.50           # lock 50%
 
-# ============== STATE ==============
-ticks = deque(maxlen=500)
-micro = deque(maxlen=MICRO_SLICE)
+# ============== STATE ================
+ticks = deque(maxlen=WINDOW)
+balance = 0.0
+start_balance = 0.0
+session_peak = 0.0
+locked_balance = 0.0
 
-BAL = 0.0
-MAX_BAL = 0.0
-WINS = 0
-LOSSES = 0
+wins = 0
+losses = 0
+edge = 0.0
 
+last_trade_ts = 0.0
 trade_in_progress = False
-last_trade_time = 0
-last_signal = None
+trade_sent_ts = 0.0
 
 ws = None
 
-# ============== LOG ==============
+# ============== UTILS =================
 def log(msg):
-    print(f"[{datetime.utcnow().isoformat()}] {msg}", flush=True)
+    print(f"[{datetime.now(timezone.utc).isoformat()}] {msg}", flush=True)
 
-# ============== MATH ==============
-def ema(data, p):
-    if len(data) < p:
+def ema(values, period):
+    if len(values) < period:
         return None
-    w = np.exp(np.linspace(-1, 0, p))
-    w /= w.sum()
-    return np.convolve(data[-p:], w, mode="valid")[0]
+    k = 2 / (period + 1)
+    e = values[0]
+    for v in values[1:]:
+        e = v * k + e * (1 - k)
+    return e
 
-def market_expanding():
-    if len(ticks) < VOL_WINDOW:
+# ============== PROFIT LOCK ==========
+def update_profit_lock():
+    global session_peak, locked_balance
+    session_peak = max(session_peak, balance)
+    gain = session_peak - start_balance
+    if start_balance > 0 and gain / start_balance >= LOCK_TRIGGER_PCT:
+        locked_balance = start_balance + gain * LOCK_RATIO
+
+def profit_lock_ok():
+    if locked_balance > 0 and balance <= locked_balance:
+        log("🔒 PROFIT LOCK HIT — TRADING HALTED")
         return False
-    return np.std(list(ticks)[-VOL_WINDOW:]) >= VOL_THRESHOLD
+    return True
 
-def breakout_confidence():
-    if len(micro) < 5:
+# ============== SIGNAL =================
+def detect_signal():
+    if len(ticks) < EMA_SLOW:
         return None, 0.0
-    arr = np.array(micro)
-    hi, lo = arr.max(), arr.min()
-    rng = hi - lo
-    if rng < 0.002:
+
+    prices = list(ticks)
+    ef = ema(prices[-EMA_FAST:], EMA_FAST)
+    es = ema(prices[-EMA_SLOW:], EMA_SLOW)
+
+    if ef is None or es is None:
         return None, 0.0
-    cur = arr[-1]
-    std = arr.std()
-    if cur >= hi - 0.2*rng:
-        return "CALL", min(1, std*200)
-    if cur <= lo + 0.2*rng:
-        return "PUT", min(1, std*200)
-    mom = cur - arr[-3]
-    return ("CALL" if mom > 0 else "PUT"), min(1, abs(mom)*150)
 
-def dynamic_stake(conf):
-    risk = BAL * TRADE_RISK_FRAC
-    return min(BASE_STAKE + conf*risk, MAX_STAKE)
+    vol = np.std(prices)
+    if vol <= 0:
+        return None, 0.0
 
-# ============== SAFETY ==============
-def watchdog():
-    global trade_in_progress
-    while True:
-        if trade_in_progress and time.time() - last_trade_time > TRADE_TIMEOUT:
+    diff = abs(ef - es)
+    conf = min(1.0, diff / (vol * 0.6))
+    direction = "CALL" if ef > es else "PUT"
+
+    return direction, conf
+
+# ============== TRADING =================
+def maybe_trade():
+    global last_trade_ts, trade_in_progress, trade_sent_ts
+
+    if trade_in_progress:
+        if time.time() - trade_sent_ts > TRADE_TIMEOUT:
             log("⚠ TRADE TIMEOUT — RESET")
             trade_in_progress = False
-        time.sleep(1)
+        return
 
-def session_ok():
-    if MAX_BAL <= 0:
-        return True
-    dd = (MAX_BAL - BAL) / MAX_BAL
-    return dd < MAX_DD
+    if not profit_lock_ok():
+        return
 
-# ============== DERIV ACTIONS ==============
-def authorize():
-    ws.send(json.dumps({"authorize": API_TOKEN}))
+    now = time.time()
+    if now - last_trade_ts < COOLDOWN:
+        return
 
-def subscribe():
-    ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
-    ws.send(json.dumps({"balance": 1, "subscribe": 1}))
+    direction, conf = detect_signal()
+    if not direction or conf < CONF_THRESHOLD:
+        return
 
-def request_proposal(ct, stake):
-    global trade_in_progress, last_trade_time
+    stake = round(BASE_STAKE * (1 + edge), 2)
+    if locked_balance > 0:
+        stake *= 0.7  # reduce risk after lock
+
+    send_trade(direction, stake)
+    last_trade_ts = now
     trade_in_progress = True
-    last_trade_time = time.time()
+    trade_sent_ts = time.time()
+
+def send_trade(direction, stake):
+    log(f"📨 PROPOSAL {direction} | stake={stake}")
     ws.send(json.dumps({
-        "proposal": 1,
-        "amount": stake,
-        "basis": "stake",
-        "contract_type": ct,
-        "currency": "USD",
-        "duration": 1,
-        "duration_unit": "t",
-        "symbol": SYMBOL
+        "buy": 1,
+        "price": stake,
+        "parameters": {
+            "amount": stake,
+            "basis": "stake",
+            "contract_type": direction,
+            "currency": "USD",
+            "duration": 1,
+            "duration_unit": "t",
+            "symbol": SYMBOL
+        }
     }))
-    log(f"📨 PROPOSAL {ct} | stake={stake:.2f}")
+    log("🔥 BUY SENT")
 
-# ============== WS CALLBACKS ==============
-def on_message(ws_, msg):
-    global BAL, MAX_BAL, WINS, LOSSES, trade_in_progress, last_signal
+# ============== WS HANDLERS ===========
+def on_message(wsapp, message):
+    global balance, wins, losses, edge, trade_in_progress, start_balance
 
-    data = json.loads(msg)
+    data = json.loads(message)
 
-    if "authorize" in data:
-        log("AUTHORIZED")
-        subscribe()
-
-    elif "balance" in data:
-        BAL = float(data["balance"]["balance"])
-        MAX_BAL = max(MAX_BAL, BAL)
-
-    elif "tick" in data:
+    if "tick" in data:
         price = float(data["tick"]["quote"])
         ticks.append(price)
-        micro.append(price)
+        maybe_trade()
 
-        if trade_in_progress or not session_ok() or not market_expanding():
-            return
-
-        ct, conf = breakout_confidence()
-        if not ct or conf < 0.5 or ct == last_signal:
-            return
-
-        f = ema(list(micro), EMA_FAST)
-        s = ema(list(micro), EMA_SLOW)
-        if not f or not s:
-            return
-        if (ct == "CALL" and f < s) or (ct == "PUT" and f > s):
-            return
-
-        stake = dynamic_stake(conf)
-        last_signal = ct
-        request_proposal(ct, stake)
-
-    elif "proposal" in data:
-        ws.send(json.dumps({
-            "buy": data["proposal"]["id"],
-            "price": data["proposal"]["ask_price"]
-        }))
-        log("🔥 BUY SENT")
+    elif "balance" in data:
+        balance = float(data["balance"]["balance"])
+        if start_balance == 0:
+            start_balance = balance
 
     elif "proposal_open_contract" in data:
         poc = data["proposal_open_contract"]
         if poc.get("is_sold"):
-            pnl = float(poc.get("profit", 0))
+            profit = float(poc.get("profit", 0))
             trade_in_progress = False
-            if pnl > 0:
-                WINS += 1
+
+            if profit > 0:
+                wins += 1
+                edge = min(MAX_EDGE, edge + 0.03)
             else:
-                LOSSES += 1
-            log(f"✔ SETTLED | P/L={pnl:.2f} | W={WINS} L={LOSSES}")
+                losses += 1
+                edge = max(0.0, edge - 0.02)
 
-    elif "error" in data:
-        log(f"❌ {data['error']['message']}")
-        trade_in_progress = False
+            update_profit_lock()
 
-def on_open(ws_):
-    authorize()
+def on_open(wsapp):
+    log("CONNECTED & AUTHORIZED")
+    wsapp.send(json.dumps({"authorize": API_TOKEN}))
+    wsapp.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
+    wsapp.send(json.dumps({"balance": 1, "subscribe": 1}))
+    wsapp.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
 
-def on_close(ws_, *_):
-    log("🔴 WS CLOSED — RECONNECT")
+def on_error(wsapp, error):
+    log(f"WS ERROR: {error}")
+
+def on_close(wsapp, code, msg):
+    log("WS CLOSED — RECONNECTING")
     time.sleep(2)
-    start()
+    start_ws()
 
-# ============== START ==============
-def start():
+# ============== HEARTBEAT ============
+def heartbeat():
+    while True:
+        log(f"❤️ BAL={balance:.2f} W={wins} L={losses} EDGE={edge:.2f} LOCK={locked_balance:.2f}")
+        time.sleep(30)
+
+# ============== MAIN ==================
+def start_ws():
     global ws
     ws = websocket.WebSocketApp(
-        DERIV_WS,
+        f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}",
         on_open=on_open,
         on_message=on_message,
+        on_error=on_error,
         on_close=on_close
     )
-    ws.run_forever(ping_interval=30)
+    ws.run_forever(ping_interval=20, ping_timeout=10)
 
 if __name__ == "__main__":
-    log("🚀 MOMENTO CLOUD BOT — KOYEB READY")
-    threading.Thread(target=watchdog, daemon=True).start()
-    start()
+    log("🚀 MOMENTO — FIRING BOT + PROFIT LOCK (KOYEB READY)")
+    threading.Thread(target=heartbeat, daemon=True).start()
+    start_ws()
