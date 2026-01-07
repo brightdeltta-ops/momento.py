@@ -1,16 +1,10 @@
 # =====================================
-# MOMENTO — MONTE CARLO ALPHA (KOYEB)
+# MOMENTO — MONTE CARLO ALPHA (KOYEB FIXED)
 # =====================================
 
-import os
-import json
-import time
-import math
-import websocket
-import threading
+import os, json, time, threading, websocket
 from collections import deque
 from datetime import datetime, timezone
-
 import numpy as np
 
 # ============== ENV ==================
@@ -22,26 +16,26 @@ BASE_STAKE = float(os.getenv("BASE_STAKE", "100"))
 # ============== PARAMETERS ===========
 EMA_FAST = 5
 EMA_SLOW = 21
-MICRO_LEN = 30
+WINDOW = 30
 
 CONF_THRESHOLD = 0.25
 COOLDOWN = 2.0
 MAX_EDGE = 0.25
 
 # ============== STATE ================
-ticks = deque(maxlen=MICRO_LEN)
+ticks = deque(maxlen=WINDOW)
 balance = 0.0
 wins = 0
 losses = 0
 edge = 0.0
-last_trade_ts = 0
+last_trade_ts = 0.0
 ws = None
 
 # ============== UTILS =================
 def log(msg):
     print(f"[{datetime.now(timezone.utc).isoformat()}] {msg}", flush=True)
 
-def ema(values, period):
+def ema_from_list(values, period):
     if len(values) < period:
         return None
     k = 2 / (period + 1)
@@ -51,21 +45,23 @@ def ema(values, period):
     return e
 
 # ============== CORE LOGIC ============
-def detect_confidence():
+def detect_signal():
     if len(ticks) < EMA_SLOW:
         return None, 0.0
 
-    ef = ema(ticks, EMA_FAST)
-    es = ema(ticks, EMA_SLOW)
+    prices = list(ticks)  # 🔑 FIX: convert deque → list
+
+    ef = ema_from_list(prices[-EMA_FAST:], EMA_FAST)
+    es = ema_from_list(prices[-EMA_SLOW:], EMA_SLOW)
+
     if ef is None or es is None:
         return None, 0.0
 
-    diff = abs(ef - es)
-    vol = np.std(ticks)
-
-    if vol == 0:
+    vol = np.std(prices)
+    if vol <= 0:
         return None, 0.0
 
+    diff = abs(ef - es)
     confidence = min(1.0, diff / (vol * 0.6))
     direction = "CALL" if ef > es else "PUT"
 
@@ -78,8 +74,8 @@ def maybe_trade():
     if now - last_trade_ts < COOLDOWN:
         return
 
-    direction, confidence = detect_confidence()
-    if not direction or confidence < CONF_THRESHOLD:
+    direction, conf = detect_signal()
+    if not direction or conf < CONF_THRESHOLD:
         return
 
     stake = round(BASE_STAKE * (1 + edge), 2)
@@ -120,8 +116,8 @@ def on_message(wsapp, message):
     elif "proposal_open_contract" in data:
         poc = data["proposal_open_contract"]
         if poc.get("is_sold"):
-            pl = float(poc.get("profit", 0))
-            if pl > 0:
+            profit = float(poc.get("profit", 0))
+            if profit > 0:
                 wins += 1
                 edge = min(MAX_EDGE, edge + 0.03)
             else:
@@ -133,6 +129,7 @@ def on_open(wsapp):
     wsapp.send(json.dumps({"authorize": API_TOKEN}))
     wsapp.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
     wsapp.send(json.dumps({"balance": 1, "subscribe": 1}))
+    wsapp.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
 
 def on_error(wsapp, error):
     log(f"ERROR {error}")
@@ -148,14 +145,14 @@ def heartbeat():
 
 # ============== MAIN ==================
 if __name__ == "__main__":
-    log("🚀 MONTE-CARLO ALPHA BOT — KOYEB READY")
+    log("🚀 MONTE-CARLO ALPHA BOT — KOYEB READY (FIXED)")
 
     threading.Thread(target=heartbeat, daemon=True).start()
 
     ws = websocket.WebSocketApp(
         f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}",
-        on_message=on_message,
         on_open=on_open,
+        on_message=on_message,
         on_error=on_error,
         on_close=on_close
     )
