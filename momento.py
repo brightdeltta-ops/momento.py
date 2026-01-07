@@ -1,25 +1,30 @@
-import json, threading, time, websocket, numpy as np, os
+import os
+import json
+import time
+import threading
+import websocket
+import numpy as np
 from collections import deque
 
 # ================= USER CONFIG =================
-API_TOKEN = os.environ.get("DERIV_API_TOKEN")  # <-- from environment
+API_TOKEN = os.getenv("DERIV_API_TOKEN")  # Token from Koyeb env variable
 if not API_TOKEN:
-    raise ValueError("Missing DERIV_API_TOKEN environment variable")
+    raise ValueError("API token not set. Please set DERIV_API_TOKEN in Koyeb environment variables.")
 
-APP_ID = int(os.environ.get("APP_ID", 112380))
-SYMBOL = os.environ.get("SYMBOL", "R_75")
+APP_ID = 112380
+SYMBOL = "R_75"
 
-BASE_STAKE = 200.0
-MAX_STAKE = 1000.0
+BASE_STAKE = 1.0
+MAX_STAKE = 100.0
 TRADE_RISK_FRAC = 0.02
 PROPOSAL_COOLDOWN = 6
-PROPOSAL_DELAY = 12
+PROPOSAL_DELAY = 1  # seconds delay before buying proposal
 EMA_FAST = 3
 EMA_SLOW = 10
 MICRO_SLICE = 10
 VOLATILITY_WINDOW = 20
 VOLATILITY_THRESHOLD = 0.0015
-MAX_DD = 0.2  # max 20% drawdown
+MAX_DD = 0.2  # 20% drawdown
 
 # ================= DATA TRACKING =================
 tick_history = deque(maxlen=500)
@@ -47,10 +52,10 @@ DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 # ================= UTILITIES =================
 def append_alert(msg):
     with lock:
-        print(f"[{time.strftime('%H:%M:%S')}] {msg}")
+        print(msg)
 
 def auto_unfreeze():
-    global trade_in_progress
+    global trade_in_progress, last_trade_time
     while True:
         time.sleep(2)
         if trade_in_progress and time.time() - last_trade_time > 5:
@@ -60,7 +65,7 @@ def auto_unfreeze():
 def calculate_ema(data, period):
     if len(data) < period:
         return None
-    weights = np.exp(np.linspace(-1., 0., period))
+    weights = np.exp(np.linspace(-1.,0.,period))
     weights /= weights.sum()
     return np.convolve(data[-period:], weights, mode="valid")[0]
 
@@ -68,7 +73,8 @@ def is_market_expanding():
     if len(tick_history) < VOLATILITY_WINDOW:
         return False
     window = np.array(list(tick_history)[-VOLATILITY_WINDOW:])
-    return window.std() >= VOLATILITY_THRESHOLD
+    vol = window.std()
+    return vol >= VOLATILITY_THRESHOLD
 
 def session_loss_check():
     global BALANCE
@@ -88,7 +94,7 @@ def check_trade_memory(direction):
     last_direction = direction
     return True
 
-# ================= MICRO-FRACTAL + EMA =================
+# ================= TRADE LOGIC =================
 def get_breakout_confidence():
     if len(tick_buffer) < 5:
         return None, 0
@@ -99,12 +105,12 @@ def get_breakout_confidence():
     if rng < 0.002:
         return None, 0
     current = recent[-1]
-    if current >= high - 0.2*rng:
+    if current >= high - 0.2 * rng:
         return "up", min(1, std*200)
-    if current <= low + 0.2*rng:
+    if current <= low + 0.2 * rng:
         return "down", min(1, std*200)
     momentum = current - recent[-3]
-    return ("up" if momentum > 0 else "down", min(1, abs(momentum)*150))
+    return ("up" if momentum>0 else "down", min(1, abs(momentum)*150))
 
 def evaluate_and_trade():
     global last_proposal_time, TRADE_AMOUNT
@@ -173,14 +179,13 @@ def on_contract_settlement(c):
     profit = float(c.get("profit") or 0)
     BALANCE += profit
     MAX_BALANCE = max(MAX_BALANCE, BALANCE)
-    drawdown = (MAX_BALANCE - BALANCE)/MAX_BALANCE*100 if MAX_BALANCE>0 else 0
     if profit > 0:
         WINS += 1
     else:
         LOSSES += 1
     TRADE_COUNT += 1
     trade_in_progress = False
-    append_alert(f"✔ Settlement → Profit: {profit:.2f} | Drawdown: {drawdown:.1f}%")
+    append_alert(f"✔ Settlement → Profit: {profit:.2f} | Drawdown: {(MAX_BALANCE-BALANCE)/MAX_BALANCE*100 if MAX_BALANCE>0 else 0:.1f}%")
     process_trade_queue()
 
 # ================= WEBSOCKET =================
@@ -213,7 +218,8 @@ def on_message(ws, msg):
         append_alert(f"⚠ WS Error: {e}")
 
 def resubscribe_channels():
-    if not authorized: return
+    if not authorized:
+        return
     ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
     ws.send(json.dumps({"balance": 1, "subscribe": 1}))
     ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
@@ -246,14 +252,17 @@ def keep_alive():
         time.sleep(15)
         try:
             ws.send(json.dumps({"ping": 1}))
-        except: pass
+        except:
+            pass
 
-# ================= START BOT =================
-if __name__ == "__main__":
-    append_alert("🚀 MOMENTO BOT — Koyeb headless mode starting")
+# ================= START =================
+def start():
+    append_alert("🚀 MOMENTO BOT — HEADLESS KOYEB READY")
     start_ws()
     threading.Thread(target=keep_alive, daemon=True).start()
     threading.Thread(target=auto_unfreeze, daemon=True).start()
-
     while True:
-        time.sleep(1)
+        time.sleep(1)  # Keep script alive
+
+if __name__ == "__main__":
+    start()
