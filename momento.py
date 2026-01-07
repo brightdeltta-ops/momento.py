@@ -1,264 +1,264 @@
-import json
-import threading
-import time
-import websocket
+import os, json, time, threading, websocket
 import numpy as np
-import os
 from collections import deque
+from sklearn.neural_network import MLPClassifier
 
-# =================================================
-# ENV CONFIG (KOYEB SAFE)
-# =================================================
+# ================= CONFIG =================
 API_TOKEN = os.getenv("DERIV_API_TOKEN")
-APP_ID = int(os.getenv("DERIV_APP_ID", "112380"))
-
-if not API_TOKEN:
-    raise RuntimeError("❌ DERIV_API_TOKEN not set")
+APP_ID = int(os.getenv("APP_ID", "112380"))
 
 SYMBOL = "R_75"
-DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
-# =================================================
-# STRATEGY CONFIG
-# =================================================
 BASE_STAKE = 1.0
 MAX_STAKE = 100.0
-RISK_FRAC = 0.02
-PROPOSAL_COOLDOWN = 5
-EMA_FAST = 3
-EMA_SLOW = 10
-VOL_WINDOW = 20
-VOL_THRESHOLD = 0.0015
-MAX_DRAWDOWN = 0.20
+MARTI_MULTIPLIER = 1.6
+MAX_MARTI_STEPS = 4
+SAFE_RISK = 0.05
 
-# =================================================
-# STATE
-# =================================================
+EMA_FAST, EMA_MED, EMA_SLOW = 3, 6, 12
+MIN_CONFIDENCE = 0.65
+PROPOSAL_COOLDOWN = 1.0
+
+DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+
+# ================= STATE =================
 ticks = deque(maxlen=500)
-micro = deque(maxlen=10)
-trade_queue = deque(maxlen=5)
+trade_queue = deque(maxlen=20)
+bias_memory = deque(maxlen=200)
 
 BALANCE = 0.0
-MAX_BALANCE = 0.0
-WINS = 0
-LOSSES = 0
-TRADES = 0
+WINS = LOSSES = TRADES = 0
 
-last_trade_time = 0
-last_signal = None
+ema_fast = ema_med = ema_slow = 0.0
+current_stake = BASE_STAKE
+marti_step = 0
+
 trade_in_progress = False
-authorized = False
-ws_running = False
+last_trade_time = 0
+last_proposal_time = 0
+
 ws = None
 lock = threading.Lock()
 
-# =================================================
-# LOGGING
-# =================================================
+# ================= UTIL =================
 def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    with lock:
+        print(msg, flush=True)
 
-# =================================================
-# MATH
-# =================================================
-def ema(data, period):
-    if len(data) < period:
+def calc_ema(prev, price, p):
+    alpha = 2 / (p + 1)
+    return price if prev == 0 else prev * (1 - alpha) + price * alpha
+
+# ================= MARKET LOGIC =================
+def detect_trend():
+    if ema_fast > ema_med > ema_slow:
+        return "UP"
+    if ema_fast < ema_med < ema_slow:
+        return "DOWN"
+    return None
+
+def detect_momentum():
+    if len(ticks) < 5:
+        return None, 0
+    arr = np.array(list(ticks)[-5:])
+    delta = arr[-1] - arr[0]
+    strength = min(abs(delta) / (np.std(arr) + 1e-6), 1)
+    return ("UP" if delta > 0 else "DOWN"), strength
+
+# ================= ML ENGINE =================
+mlp = MLPClassifier(hidden_layer_sizes=(16,16), max_iter=300)
+mlp_X = deque(maxlen=300)
+mlp_y = deque(maxlen=300)
+mlp_ready = False
+
+def extract_features():
+    if len(ticks) < 30:
         return None
-    w = np.exp(np.linspace(-1., 0., period))
-    w /= w.sum()
-    return np.convolve(data[-period:], w, mode="valid")[0]
+    arr = np.array(list(ticks)[-30:])
+    return np.array([
+        arr[-1] - arr[-5],
+        np.std(arr),
+        np.mean(np.diff(arr)),
+        ema_fast - ema_slow,
+        np.max(arr) - np.min(arr)
+    ])
 
-def market_expanding():
-    if len(ticks) < VOL_WINDOW:
-        return False
-    return np.std(list(ticks)[-VOL_WINDOW:]) >= VOL_THRESHOLD
-
-def dynamic_stake(conf):
-    risk = BALANCE * RISK_FRAC
-    stake = BASE_STAKE + conf * risk
-    return min(stake, MAX_STAKE)
-
-def session_ok():
-    if MAX_BALANCE == 0:
-        return True
-    dd = (MAX_BALANCE - BALANCE) / MAX_BALANCE
-    return dd < MAX_DRAWDOWN
-
-# =================================================
-# SIGNAL LOGIC
-# =================================================
-def breakout_signal():
-    if len(micro) < 5:
+def ml_predict():
+    if not mlp_ready:
         return None, 0
-
-    arr = np.array(micro)
-    hi, lo = arr.max(), arr.min()
-    rng = hi - lo
-    if rng < 0.002:
+    X = extract_features()
+    if X is None:
         return None, 0
+    p = mlp.predict_proba([X])[0]
+    return ("UP" if p[1] > p[0] else "DOWN"), max(p)
 
-    cur = arr[-1]
-    if cur >= hi - 0.2 * rng:
-        return "up", min(1, rng * 300)
-    if cur <= lo + 0.2 * rng:
-        return "down", min(1, rng * 300)
+def train_ml(direction, profit):
+    global mlp_ready
+    X = extract_features()
+    if X is None:
+        return
+    y = 1 if direction == "UP" else 0
+    if profit < 0:
+        y = 1 - y
+    mlp_X.append(X)
+    mlp_y.append(y)
+    if len(mlp_y) >= 20:
+        mlp.fit(list(mlp_X), list(mlp_y))
+        mlp_ready = True
 
-    mom = cur - arr[-3]
-    return ("up" if mom > 0 else "down", min(1, abs(mom) * 200))
+# ================= STAKE CONTROL =================
+def calculate_stake(conf):
+    global marti_step
+    stake = BASE_STAKE * (MARTI_MULTIPLIER ** marti_step) * (1 + conf)
+    max_allowed = max(BALANCE * SAFE_RISK, BASE_STAKE)
+    return min(stake, max_allowed, MAX_STAKE)
 
-def evaluate():
-    global last_trade_time, last_signal
+# ================= TRADE ENGINE =================
+def evaluate_trade():
+    global last_proposal_time
+    now = time.time()
 
     if trade_in_progress:
         return
-    if time.time() - last_trade_time < PROPOSAL_COOLDOWN:
-        return
-    if not session_ok():
-        log("⚠ DRAWNDOWN LIMIT — PAUSED")
-        return
-    if not market_expanding():
+    if now - last_proposal_time < PROPOSAL_COOLDOWN:
         return
 
-    direction, conf = breakout_signal()
-    if conf < 0.5:
-        return
-    if direction == last_signal:
+    trend = detect_trend()
+    momentum, m_conf = detect_momentum()
+    ml_dir, ml_conf = ml_predict()
+
+    votes = {"UP": 0, "DOWN": 0}
+    if trend: votes[trend] += 0.4
+    if momentum: votes[momentum] += m_conf
+    if ml_dir: votes[ml_dir] += ml_conf * 1.2
+
+    direction = "UP" if votes["UP"] > votes["DOWN"] else "DOWN"
+    confidence = abs(votes["UP"] - votes["DOWN"])
+
+    if confidence < MIN_CONFIDENCE:
         return
 
-    f = ema(list(micro), EMA_FAST)
-    s = ema(list(micro), EMA_SLOW)
-    if f is None or s is None:
-        return
-
-    trend = "up" if f > s else "down"
-    if trend != direction:
-        return
-
-    stake = dynamic_stake(conf)
-    trade_queue.append((direction, 1, stake))
-    last_trade_time = time.time()
-    last_signal = direction
-
-    log(f"🚀 SIGNAL {direction.upper()} | stake={stake:.2f} conf={conf:.2f}")
+    stake = calculate_stake(confidence)
+    trade_queue.append((direction, stake))
+    last_proposal_time = now
+    log(f"🚀 QUEUED {direction} | Stake {stake:.2f} | Conf {confidence:.2f}")
     process_queue()
 
-# =================================================
-# TRADING
-# =================================================
 def process_queue():
-    global trade_in_progress
     if trade_queue and not trade_in_progress:
-        d, dur, amt = trade_queue.popleft()
-        send_proposal(d, dur, amt)
+        d, s = trade_queue.popleft()
+        send_trade(d, s)
 
-def send_proposal(direction, duration, stake):
-    global trade_in_progress
+def send_trade(direction, stake):
+    global trade_in_progress, last_trade_time
     trade_in_progress = True
+    last_trade_time = time.time()
 
-    ct = "CALL" if direction == "up" else "PUT"
     ws.send(json.dumps({
         "proposal": 1,
         "amount": stake,
         "basis": "stake",
-        "contract_type": ct,
+        "contract_type": "CALL" if direction == "UP" else "PUT",
         "currency": "USD",
-        "duration": duration,
+        "duration": 1,
         "duration_unit": "t",
         "symbol": SYMBOL
     }))
+    log(f"📨 PROPOSAL SENT → {direction} | {stake:.2f}")
 
-    log(f"📨 PROPOSAL {ct} | stake={stake:.2f}")
+# ================= SETTLEMENT =================
+def settle(contract):
+    global BALANCE, WINS, LOSSES, TRADES, marti_step, trade_in_progress
 
-def settle(c):
-    global BALANCE, MAX_BALANCE, WINS, LOSSES, TRADES, trade_in_progress
-
-    profit = float(c.get("profit") or 0)
+    profit = float(contract.get("profit", 0))
     BALANCE += profit
-    MAX_BALANCE = max(MAX_BALANCE, BALANCE)
+    TRADES += 1
+
+    direction = "UP" if contract["contract_type"] == "CALL" else "DOWN"
+    train_ml(direction, profit)
 
     if profit > 0:
         WINS += 1
+        marti_step = 0
     else:
         LOSSES += 1
+        marti_step = min(marti_step + 1, MAX_MARTI_STEPS)
 
-    TRADES += 1
     trade_in_progress = False
-
-    log(f"✔ RESULT {profit:.2f} | BAL={BALANCE:.2f}")
+    log(f"✔ SETTLED {profit:.2f} | BAL {BALANCE:.2f}")
     process_queue()
 
-# =================================================
-# WEBSOCKET
-# =================================================
+# ================= WS =================
 def on_message(ws, msg):
-    global authorized, BALANCE
+    global BALANCE
     data = json.loads(msg)
 
     if "authorize" in data:
-        authorized = True
         ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
         ws.send(json.dumps({"balance": 1, "subscribe": 1}))
         ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
-        log("✅ AUTHORIZED")
+        log("✔ AUTHORIZED")
 
     if "tick" in data:
-        price = float(data["tick"]["quote"])
-        ticks.append(price)
-        micro.append(price)
-        evaluate()
+        ticks.append(float(data["tick"]["quote"]))
+        evaluate_trade()
+
+    if "balance" in data:
+        BALANCE = float(data["balance"]["balance"])
 
     if "proposal" in data:
-        pid = data["proposal"]["id"]
-        ws.send(json.dumps({"buy": pid, "price": data["proposal"]["ask_price"]}))
+        ws.send(json.dumps({"buy": data["proposal"]["id"], "price": data["proposal"]["amount"]}))
 
     if "proposal_open_contract" in data:
         c = data["proposal_open_contract"]
         if c.get("is_sold") or c.get("is_expired"):
             settle(c)
 
-    if "balance" in data:
-        BALANCE = float(data["balance"]["balance"])
+def on_open(ws):
+    log("🔌 CONNECTED")
+    ws.send(json.dumps({"authorize": API_TOKEN}))
 
 def on_close(ws, *_):
-    global ws_running
-    log("❌ WS CLOSED — RECONNECTING")
-    ws_running = False
+    log("❌ DISCONNECTED → RECONNECTING")
     time.sleep(2)
     start_ws()
 
-def on_error(ws, err):
-    log(f"❌ WS ERROR: {err}")
-
 def start_ws():
-    global ws, ws_running
-    if ws_running:
-        return
-    ws_running = True
-
+    global ws
     ws = websocket.WebSocketApp(
         DERIV_WS,
-        on_open=lambda w: w.send(json.dumps({"authorize": API_TOKEN})),
+        on_open=on_open,
         on_message=on_message,
-        on_error=on_error,
         on_close=on_close
     )
-
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
-def keep_alive():
+# ================= AUTO UNFREEZE =================
+def watchdog():
+    global trade_in_progress
     while True:
-        time.sleep(15)
-        try:
-            ws.send(json.dumps({"ping": 1}))
-        except:
-            pass
+        time.sleep(1)
+        if trade_in_progress and time.time() - last_trade_time > 6:
+            trade_in_progress = False
+            log("⚠ AUTO-UNFREEZE")
+            process_queue()
 
-# =================================================
-# START
-# =================================================
+# ================= EMA ENGINE =================
+def ema_engine():
+    global ema_fast, ema_med, ema_slow
+    while True:
+        if ticks:
+            p = ticks[-1]
+            ema_fast = calc_ema(ema_fast, p, EMA_FAST)
+            ema_med = calc_ema(ema_med, p, EMA_MED)
+            ema_slow = calc_ema(ema_slow, p, EMA_SLOW)
+        time.sleep(0.05)
+
+# ================= MAIN =================
 if __name__ == "__main__":
-    log("🚀 MOMENTO BOT — KOYEB MODE")
+    log("🚀 MOMENTO CLOUD BOT STARTED")
     start_ws()
-    threading.Thread(target=keep_alive, daemon=True).start()
+    threading.Thread(target=ema_engine, daemon=True).start()
+    threading.Thread(target=watchdog, daemon=True).start()
     while True:
         time.sleep(60)
