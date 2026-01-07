@@ -1,184 +1,200 @@
-import json
-import threading
-import time
-import websocket
-import os
+import json, time, threading, websocket, os
+import numpy as np
+from collections import deque
 from datetime import datetime
 
-# ================== ENV CONFIG ==================
+# ============== ENV CONFIG ==============
 API_TOKEN = os.getenv("DERIV_API_TOKEN")
-APP_ID = os.getenv("APP_ID", "1089")
-SYMBOL = os.getenv("SYMBOL", "R_100")
-STAKE = float(os.getenv("STAKE", "200"))
+APP_ID = os.getenv("APP_ID", "112380")
+SYMBOL = os.getenv("SYMBOL", "R_75")
 
-WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+BASE_STAKE = float(os.getenv("BASE_STAKE", "1"))
+MAX_STAKE = 100.0
+TRADE_RISK_FRAC = 0.02
 
-# ================== BOT STATE ==================
-ws = None
+EMA_FAST = 3
+EMA_SLOW = 10
+MICRO_SLICE = 10
+VOL_WINDOW = 20
+VOL_THRESHOLD = 0.0015
+
+PROPOSAL_COOLDOWN = 6
+TRADE_TIMEOUT = 8
+MAX_DD = 0.2
+
+DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+
+# ============== STATE ==============
+ticks = deque(maxlen=500)
+micro = deque(maxlen=MICRO_SLICE)
+
+BAL = 0.0
+MAX_BAL = 0.0
+WINS = 0
+LOSSES = 0
+
 trade_in_progress = False
-trade_start_ts = 0
-TRADE_TIMEOUT = 10
+last_trade_time = 0
+last_signal = None
 
-wins = 0
-losses = 0
-balance = 0.0
-edge = 0.0
+ws = None
 
-last_price = None
-trend_score = 0.0
-
-# ================== LOG ==================
+# ============== LOG ==============
 def log(msg):
     print(f"[{datetime.utcnow().isoformat()}] {msg}", flush=True)
 
-# ================== DERIV HELPERS ==================
+# ============== MATH ==============
+def ema(data, p):
+    if len(data) < p:
+        return None
+    w = np.exp(np.linspace(-1, 0, p))
+    w /= w.sum()
+    return np.convolve(data[-p:], w, mode="valid")[0]
+
+def market_expanding():
+    if len(ticks) < VOL_WINDOW:
+        return False
+    return np.std(list(ticks)[-VOL_WINDOW:]) >= VOL_THRESHOLD
+
+def breakout_confidence():
+    if len(micro) < 5:
+        return None, 0.0
+    arr = np.array(micro)
+    hi, lo = arr.max(), arr.min()
+    rng = hi - lo
+    if rng < 0.002:
+        return None, 0.0
+    cur = arr[-1]
+    std = arr.std()
+    if cur >= hi - 0.2*rng:
+        return "CALL", min(1, std*200)
+    if cur <= lo + 0.2*rng:
+        return "PUT", min(1, std*200)
+    mom = cur - arr[-3]
+    return ("CALL" if mom > 0 else "PUT"), min(1, abs(mom)*150)
+
+def dynamic_stake(conf):
+    risk = BAL * TRADE_RISK_FRAC
+    return min(BASE_STAKE + conf*risk, MAX_STAKE)
+
+# ============== SAFETY ==============
+def watchdog():
+    global trade_in_progress
+    while True:
+        if trade_in_progress and time.time() - last_trade_time > TRADE_TIMEOUT:
+            log("⚠ TRADE TIMEOUT — RESET")
+            trade_in_progress = False
+        time.sleep(1)
+
+def session_ok():
+    if MAX_BAL <= 0:
+        return True
+    dd = (MAX_BAL - BAL) / MAX_BAL
+    return dd < MAX_DD
+
+# ============== DERIV ACTIONS ==============
 def authorize():
     ws.send(json.dumps({"authorize": API_TOKEN}))
 
-def request_balance():
+def subscribe():
+    ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
     ws.send(json.dumps({"balance": 1, "subscribe": 1}))
 
-def request_ticks():
-    ws.send(json.dumps({
-        "ticks": SYMBOL,
-        "subscribe": 1
-    }))
-
-def request_proposal(direction):
-    global trade_start_ts
-    trade_start_ts = time.time()
-    log(f"📨 PROPOSAL {direction} | stake={STAKE}")
+def request_proposal(ct, stake):
+    global trade_in_progress, last_trade_time
+    trade_in_progress = True
+    last_trade_time = time.time()
     ws.send(json.dumps({
         "proposal": 1,
-        "amount": STAKE,
+        "amount": stake,
         "basis": "stake",
-        "contract_type": direction,
+        "contract_type": ct,
         "currency": "USD",
         "duration": 1,
         "duration_unit": "t",
         "symbol": SYMBOL
     }))
+    log(f"📨 PROPOSAL {ct} | stake={stake:.2f}")
 
-def send_buy(pid, price):
-    global trade_in_progress
-    trade_in_progress = True
-    ws.send(json.dumps({
-        "buy": pid,
-        "price": price
-    }))
-    log(f"🔥 BUY SENT | price={price}")
+# ============== WS CALLBACKS ==============
+def on_message(ws_, msg):
+    global BAL, MAX_BAL, WINS, LOSSES, trade_in_progress, last_signal
 
-# ================== STRATEGY ==================
-def analyze_tick(price):
-    global last_price, trend_score
-
-    if last_price is None:
-        last_price = price
-        return None, 0.0
-
-    delta = price - last_price
-    last_price = price
-
-    trend_score = 0.8 * trend_score + 0.2 * delta
-    confidence = min(abs(trend_score) * 50, 1.0)
-
-    if confidence < 0.55:
-        return None, confidence
-
-    return ("CALL" if trend_score > 0 else "PUT"), confidence
-
-# ================== WATCHDOG ==================
-def trade_watchdog():
-    global trade_in_progress
-    while True:
-        if trade_in_progress and time.time() - trade_start_ts > TRADE_TIMEOUT:
-            log("⚠ TRADE TIMEOUT — FORCE UNLOCK")
-            trade_in_progress = False
-        time.sleep(1)
-
-# ================== WS HANDLER ==================
-def on_message(ws_, message):
-    global trade_in_progress, wins, losses, balance, edge
-
-    data = json.loads(message)
+    data = json.loads(msg)
 
     if "authorize" in data:
-        log("CONNECTED & AUTHORIZED")
-        request_balance()
-        request_ticks()
+        log("AUTHORIZED")
+        subscribe()
 
     elif "balance" in data:
-        balance = float(data["balance"]["balance"])
+        BAL = float(data["balance"]["balance"])
+        MAX_BAL = max(MAX_BAL, BAL)
 
     elif "tick" in data:
         price = float(data["tick"]["quote"])
+        ticks.append(price)
+        micro.append(price)
 
-        if trade_in_progress:
+        if trade_in_progress or not session_ok() or not market_expanding():
             return
 
-        direction, conf = analyze_tick(price)
-        if direction:
-            log(f"TREND {direction} | Conf {conf:.2f}")
-            request_proposal(direction)
+        ct, conf = breakout_confidence()
+        if not ct or conf < 0.5 or ct == last_signal:
+            return
+
+        f = ema(list(micro), EMA_FAST)
+        s = ema(list(micro), EMA_SLOW)
+        if not f or not s:
+            return
+        if (ct == "CALL" and f < s) or (ct == "PUT" and f > s):
+            return
+
+        stake = dynamic_stake(conf)
+        last_signal = ct
+        request_proposal(ct, stake)
 
     elif "proposal" in data:
-        pid = data["proposal"]["id"]
-        ask_price = float(data["proposal"]["ask_price"])
-        send_buy(pid, ask_price)
-
-    elif "buy" in data:
-        cid = data["buy"]["contract_id"]
         ws.send(json.dumps({
-            "proposal_open_contract": 1,
-            "contract_id": cid,
-            "subscribe": 1
+            "buy": data["proposal"]["id"],
+            "price": data["proposal"]["ask_price"]
         }))
+        log("🔥 BUY SENT")
 
     elif "proposal_open_contract" in data:
         poc = data["proposal_open_contract"]
         if poc.get("is_sold"):
             pnl = float(poc.get("profit", 0))
             trade_in_progress = False
-
             if pnl > 0:
-                wins += 1
+                WINS += 1
             else:
-                losses += 1
-
-            total = wins + losses
-            edge = (wins - losses) / total if total > 0 else 0.0
-
-            log(f"✔ SETTLED | P/L={pnl:.2f} | W={wins} L={losses} EDGE={edge:.2f}")
+                LOSSES += 1
+            log(f"✔ SETTLED | P/L={pnl:.2f} | W={WINS} L={LOSSES}")
 
     elif "error" in data:
-        log(f"❌ ERROR: {data['error']['message']}")
+        log(f"❌ {data['error']['message']}")
         trade_in_progress = False
 
 def on_open(ws_):
     authorize()
 
 def on_close(ws_, *_):
-    log("🔴 WS CLOSED — RECONNECTING")
+    log("🔴 WS CLOSED — RECONNECT")
     time.sleep(2)
     start()
 
-def on_error(ws_, err):
-    log(f"❌ WS ERROR: {err}")
-
-# ================== START ==================
+# ============== START ==============
 def start():
     global ws
     ws = websocket.WebSocketApp(
-        WS_URL,
-        on_message=on_message,
+        DERIV_WS,
         on_open=on_open,
-        on_close=on_close,
-        on_error=on_error
+        on_message=on_message,
+        on_close=on_close
     )
-    ws.run_forever(ping_interval=30, ping_timeout=10)
+    ws.run_forever(ping_interval=30)
 
 if __name__ == "__main__":
-    log("🚀 MOMENTO — FIRING BOT (KOYEB READY)")
-    log(f"❤️ BAL={balance:.2f} W={wins} L={losses} EDGE={edge:.2f}")
-    threading.Thread(target=trade_watchdog, daemon=True).start()
+    log("🚀 MOMENTO CLOUD BOT — KOYEB READY")
+    threading.Thread(target=watchdog, daemon=True).start()
     start()
