@@ -11,7 +11,7 @@ APP_ID = int(os.getenv("APP_ID", "0"))
 if not API_TOKEN or not APP_ID:
     raise RuntimeError("Missing DERIV_API_TOKEN or APP_ID")
 
-SYMBOL = "frxUSDJPY"
+SYMBOL = "R_75"
 BASE_STAKE = 1.0
 MAX_STAKE = 200.0
 RISK_FRAC = 0.05
@@ -23,16 +23,11 @@ VOL_THRESHOLD = 0.00025
 MAX_DD = 0.25
 LOSS_STREAK_LIMIT = 3
 STATE_FILE = "learner_state.pkl"
-MAX_TRADES_PER_HOUR = 15
-FRACTAL_SETUPS = 10
-DURATION = 5
-DURATION_UNIT = "t"
 
 # ================= STATE =================
 tick_history = deque(maxlen=500)
 tick_buffer = deque(maxlen=MICRO_SLICE)
 trade_queue = deque(maxlen=20)
-trade_timestamps = deque(maxlen=100)
 
 BALANCE = 0.0
 MAX_BALANCE = 0.0
@@ -41,7 +36,6 @@ LOSS_STREAK = 0
 TRADE_AMOUNT = BASE_STAKE
 trade_in_progress = False
 last_direction = None
-pending_proposal = None
 
 ws = None
 console = Console()
@@ -93,32 +87,6 @@ def dynamic_stake(conf):
 def session_ok():
     return MAX_BALANCE==0 or (MAX_BALANCE-BALANCE)<MAX_BALANCE*MAX_DD
 
-# ================= MAX TRADES PER HOUR =================
-def can_trade():
-    now = time.time()
-    while trade_timestamps and now - trade_timestamps[0] > 3600:
-        trade_timestamps.popleft()
-    return len(trade_timestamps) < MAX_TRADES_PER_HOUR
-
-def record_trade():
-    trade_timestamps.append(time.time())
-
-# ================= 10-FRACTAL A++ SELECTOR =================
-def fractal_selector(tick_buffer):
-    signals = []
-    for i in range(FRACTAL_SETUPS):
-        ema_fast = ema(tick_buffer, EMA_FAST + i)
-        ema_slow = ema(tick_buffer, EMA_SLOW + i)
-        if ema_fast > ema_slow:
-            signals.append(("up", 0.1 + i*0.08))
-        else:
-            signals.append(("down", 0.1 + i*0.08))
-    ups = sum(c for d,c in signals if d=="up")
-    downs = sum(c for d,c in signals if d=="down")
-    direction = "up" if ups > downs else "down"
-    confidence = max(ups, downs)/sum(c for _,c in signals)
-    return direction, confidence
-
 # ================= TRADING =================
 def evaluate():
     global TRADE_AMOUNT,last_direction,trade_in_progress
@@ -127,35 +95,26 @@ def evaluate():
     if np.std(list(tick_history)[-VOL_WINDOW:])<VOL_THRESHOLD: return
     f = features()
     if f is None: return
-    direction, conf = fractal_selector(np.array(tick_buffer))
+    direction, conf = learner.predict(f)
     if TRADE_COUNT<10: conf = 0.7
     if conf<0.1: return
     TRADE_AMOUNT = dynamic_stake(conf)
-    trade_queue.append((direction,DURATION,TRADE_AMOUNT))
+    trade_queue.append((direction,1,TRADE_AMOUNT))
     last_direction = direction
     process_queue()
 
 def process_queue():
     global trade_in_progress
-    if trade_queue and not trade_in_progress and can_trade():
-        d,dur,s = trade_queue.popleft()
-        record_trade()
+    if trade_queue and not trade_in_progress:
+        d,dur,s=trade_queue.popleft()
         send_proposal(d,dur,s)
 
 def send_proposal(d,dur,s):
     global trade_in_progress
     ct = "CALL" if d=="up" else "PUT"
-    ws.send(json.dumps({
-        "proposal":1,
-        "amount":s,
-        "basis":"stake",
-        "contract_type":ct,
-        "currency":"USD",
-        "duration":dur,
-        "duration_unit":DURATION_UNIT,
-        "symbol":SYMBOL
-    }))
-    console.log(f"[magenta]Proposal {ct} | Stake {s:.2f}[/magenta]")
+    ws.send(json.dumps({"proposal":1,"amount":s,"basis":"stake","contract_type":ct,
+                        "currency":"USD","duration":dur,"duration_unit":"t","symbol":SYMBOL}))
+    console.log(f"[magenta]🔥 Trade Proposal → {ct} | Stake {s:.2f}[/magenta]")
     trade_in_progress=True
 
 def settle(c):
@@ -166,7 +125,7 @@ def settle(c):
     TRADE_COUNT+=1
     LOSS_STREAK=LOSS_STREAK+1 if profit<=0 else 0
     trade_in_progress=False
-    console.log(f"[green]Trade result: P/L {profit:.2f} | Balance {BALANCE:.2f}[/green]")
+    console.log(f"[green]✅ Trade Settled → P/L {profit:.2f} | Balance {BALANCE:.2f}[/green]")
     f=features()
     if f is not None:
         learner.update(f,profit)
@@ -181,28 +140,38 @@ def resub():
 def start_ws():
     global ws
     url=f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-    console.log(f"Connecting {url}")
+    console.log(f"[cyan]Connecting {url}[/cyan]")
 
     def on_open(w): w.send(json.dumps({"authorize":API_TOKEN}))
 
     def on_message(w,msg):
+        global last_direction
         try:
             d=json.loads(msg)
             if "authorize" in d and not d["authorize"].get("error"): resub()
+
             if "tick" in d:
                 t=float(d["tick"]["quote"])
                 tick_history.append(t)
                 tick_buffer.append(t)
                 evaluate()
+                console.log(f"[cyan]Tick {len(tick_history)} → {t:.5f}[/cyan]")
+
             if "proposal" in d:
-                pid = d["proposal"]["id"]
-                console.log(f"[cyan]Buying contract {pid}[/cyan]")
-                w.send(json.dumps({"buy":pid,"price":TRADE_AMOUNT}))
+                trade_id = d["proposal"]["id"]
+                ct = "CALL" if last_direction=="up" else "PUT"
+                w.send(json.dumps({"buy": trade_id, "price": TRADE_AMOUNT}))
+                console.log(f"[magenta]🔥 Trade Fired → {ct} | Stake {TRADE_AMOUNT:.2f}[/magenta]")
+
             if "proposal_open_contract" in d:
                 c=d["proposal_open_contract"]
                 if c.get("is_sold") or c.get("is_expired"): settle(c)
-            if "balance" in d: global BALANCE; BALANCE=float(d["balance"]["balance"])
-        except Exception as e: console.log(f"[red]on_message error {e}[/red]")
+
+            if "balance" in d:
+                global BALANCE
+                BALANCE=float(d["balance"]["balance"])
+        except Exception as e:
+            console.log(f"[red]on_message error {e}[/red]")
 
     ws=websocket.WebSocketApp(url,on_open=on_open,on_message=on_message)
     threading.Thread(target=ws.run_forever,daemon=True).start()
@@ -210,22 +179,24 @@ def start_ws():
 # ================= DASHBOARD =================
 def dashboard():
     with Live(refresh_per_second=1) as live:
-        last=-1
+        last_tick=-1
         while True:
-            t=Table(title="🚀 ULTRA-ELITE USDJPY BOT — KOYEB READY")
+            t=Table(title="🚀 ULTRA-ELITE USDJPY BOT — LIVE-FIRE MODE")
             t.add_column("Metric"); t.add_column("Value")
             t.add_row("Balance",f"{BALANCE:.2f}")
             t.add_row("Max Balance",f"{MAX_BALANCE:.2f}")
             t.add_row("Trades",str(TRADE_COUNT))
             t.add_row("Loss Streak",str(LOSS_STREAK))
-            if TRADE_COUNT==last: console.log("[blue]❤️ Heartbeat[/blue]")
-            last=TRADE_COUNT
+            t.add_row("Ticks",str(len(tick_history)))
+            if len(tick_history)!=last_tick:
+                console.log(f"[blue]❤️ Heartbeat | Ticks {len(tick_history)}[/blue]")
+            last_tick=len(tick_history)
             live.update(t)
             time.sleep(1)
 
 # ================= START =================
 if __name__=="__main__":
-    console.print("[green]🚀 ULTRA-ELITE USDJPY BOT — KOYEB READY[/green]")
+    console.print("[green]🚀 ULTRA-ELITE USDJPY BOT STARTED — KOYEB READY[/green]")
     while True:
         try:
             start_ws()
