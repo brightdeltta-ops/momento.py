@@ -1,186 +1,185 @@
-import json, time, websocket, numpy as np, os
+import json
+import time
+import threading
+import websocket
+import os
 from collections import deque
 
-# ================= ENV =================
+# ===================== CONFIG =====================
 API_TOKEN = os.getenv("DERIV_API_TOKEN")
 APP_ID = int(os.getenv("APP_ID", "112380"))
 
-CURRENCY = "USD"
-
-# ================= SYMBOLS =================
-V10 = "R_10"
-V75 = "R_75"
-ACTIVE_SYMBOL = V10
-
-# ================= RISK =================
+SYMBOL = "R_10"          # V10 sniper
 BASE_STAKE = 200.0
-STAKE_UP = 1.15
-MAX_STAKE_MULT = 3.0
-TRADE_DURATION = 1
+MAX_STAKE = 500.0
+TRADE_DURATION = 1       # ticks
+COOLDOWN = 5             # seconds between trades
 
-# ================= STATE =================
-tick_history = deque(maxlen=300)
-
-BALANCE = 0
-WINS = LOSSES = TRADES = 0
-current_stake = BASE_STAKE
-
-trade_in_progress = False
-ws = None
+EMA_FAST = 9
+EMA_SLOW = 21
 
 DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
-# ================= LOG =================
-def log(m):
-    print(f"{time.strftime('%H:%M:%S')} {m}", flush=True)
+# ===================== STATE =====================
+ticks = deque(maxlen=200)
 
-# ================= MATH =================
-def ema(prices, period):
-    if len(prices) < period:
+BALANCE = 0.0
+STAKE = BASE_STAKE
+WINS = 0
+LOSSES = 0
+TRADES = 0
+
+trade_open = False
+last_trade_time = 0
+active_contract_id = None
+
+ws = None
+
+# ===================== LOG =====================
+def log(msg):
+    print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
+
+# ===================== EMA =====================
+def ema(values, period):
+    if len(values) < period:
         return None
-    w = np.exp(np.linspace(-1., 0., period))
-    w /= w.sum()
-    return np.dot(prices[-period:], w)
+    k = 2 / (period + 1)
+    ema_val = values[0]
+    for v in values[1:]:
+        ema_val = v * k + ema_val * (1 - k)
+    return ema_val
 
-def volatility_score():
-    if len(tick_history) < 20:
-        return 0
-    r = list(tick_history)[-20:]
-    return max(r) - min(r)
-
-def sniper_confidence():
-    if len(tick_history) < 6:
-        return 0
-    r = list(tick_history)[-6:]
-    momentum = abs(r[-1] - r[0])
-    slope = abs(r[-1] - r[-3])
-    vol = max(r) - min(r)
-    return min((momentum + slope + vol) * 5, 1)
-
-def micro_fractal():
-    if len(tick_history) < 7:
-        return None
-    r = list(tick_history)[-7:]
-    if r[-1] > max(r[:-1]): return "up"
-    if r[-1] < min(r[:-1]): return "down"
-    return None
-
-# ================= REGIME SWITCH =================
-def update_symbol():
-    global ACTIVE_SYMBOL, tick_history
-    v = volatility_score()
-
-    # Threshold tuned for Deriv synthetics
-    new_symbol = V75 if v > 6 else V10
-
-    if new_symbol != ACTIVE_SYMBOL:
-        ACTIVE_SYMBOL = new_symbol
-        tick_history.clear()
-        ws.send(json.dumps({"forget_all": "ticks"}))
-        ws.send(json.dumps({"ticks": ACTIVE_SYMBOL, "subscribe": 1}))
-        log(f"🔁 SWITCHED TO {ACTIVE_SYMBOL}")
-
-# ================= STRATEGY =================
-def signal():
-    prices = list(tick_history)
-
-    if ACTIVE_SYMBOL == V10:
-        ef, es, conf_min = 6, 14, 0.35
-    else:
-        ef, es, conf_min = 9, 21, 0.55
-
-    ema_f = ema(prices, ef)
-    ema_s = ema(prices, es)
-    if ema_f is None or ema_s is None:
+# ===================== STRATEGY =====================
+def get_signal():
+    if len(ticks) < EMA_SLOW + 3:
         return None
 
-    fractal = micro_fractal()
-    conf = sniper_confidence()
+    price = ticks[-1]
+    ef = ema(list(ticks)[-EMA_FAST:], EMA_FAST)
+    es = ema(list(ticks)[-EMA_SLOW:], EMA_SLOW)
 
-    if conf < conf_min:
+    if ef is None or es is None:
         return None
 
-    if fractal == "up" and ema_f > ema_s:
+    if ef > es and price > ef:
         return "CALL"
-    if fractal == "down" and ema_f < ema_s:
+    if ef < es and price < ef:
         return "PUT"
 
     return None
 
-# ================= EXECUTION =================
-def evaluate():
-    global trade_in_progress
-    if trade_in_progress:
-        return
-    sig = signal()
-    if sig:
-        buy(sig)
+# ===================== TRADE =====================
+def send_proposal(direction):
+    global trade_open, last_trade_time
 
-def buy(ct):
-    global trade_in_progress
-    trade_in_progress = True
-
-    ws.send(json.dumps({
+    proposal = {
         "proposal": 1,
-        "amount": round(current_stake, 2),
+        "amount": STAKE,
         "basis": "stake",
-        "contract_type": ct,
-        "currency": CURRENCY,
+        "contract_type": direction,
+        "currency": "USD",
         "duration": TRADE_DURATION,
         "duration_unit": "t",
-        "symbol": ACTIVE_SYMBOL
-    }))
+        "symbol": SYMBOL
+    }
 
-    log(f"🎯 {ACTIVE_SYMBOL} {ct} | STAKE {current_stake:.2f}")
+    trade_open = True
+    last_trade_time = time.time()
+    ws.send(json.dumps(proposal))
 
-def settle(c):
-    global WINS, LOSSES, TRADES, trade_in_progress, current_stake
+    log(f"🎯 {SYMBOL} {direction} | STAKE {STAKE:.2f}")
 
-    profit = float(c.get("profit") or 0)
-    trade_in_progress = False
+# ===================== WATCHDOG =====================
+def trade_watchdog():
+    global trade_open
+    while True:
+        time.sleep(1)
+        if trade_open and time.time() - last_trade_time > 8:
+            log("⚠ FORCE RELEASE — NO SETTLEMENT")
+            trade_open = False
+
+# ===================== SETTLEMENT =====================
+def settle(contract):
+    global BALANCE, STAKE, WINS, LOSSES, TRADES, trade_open, active_contract_id
+
+    profit = float(contract.get("profit", 0))
+    BALANCE += profit
     TRADES += 1
 
     if profit > 0:
         WINS += 1
-        current_stake = min(current_stake * STAKE_UP, BASE_STAKE * MAX_STAKE_MULT)
-        log(f"✔ WIN {profit:.2f} → {current_stake:.2f}")
+        STAKE = min(STAKE * 1.15, MAX_STAKE)
+        log(f"✔ WIN {profit:.2f} → {STAKE:.2f}")
     else:
         LOSSES += 1
-        current_stake = BASE_STAKE
+        STAKE = BASE_STAKE
         log(f"❌ LOSS {profit:.2f} → RESET")
 
-# ================= WS =================
+    trade_open = False
+    active_contract_id = None
+
+# ===================== WS HANDLER =====================
 def on_message(ws, msg):
+    global BALANCE, active_contract_id
+
     data = json.loads(msg)
 
-    if "authorize" in data:
-        ws.send(json.dumps({"ticks": ACTIVE_SYMBOL, "subscribe": 1}))
+    if data.get("msg_type") == "authorize":
+        ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
+        ws.send(json.dumps({"balance": 1, "subscribe": 1}))
         ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
         log("🔐 AUTHORIZED")
 
-    if "tick" in data:
-        tick_history.append(float(data["tick"]["quote"]))
-        update_symbol()
-        evaluate()
+    elif data.get("msg_type") == "tick":
+        price = float(data["tick"]["quote"])
+        ticks.append(price)
 
-    if "proposal" in data:
-        ws.send(json.dumps({"buy": data["proposal"]["id"], "price": current_stake}))
+        if not trade_open and time.time() - last_trade_time > COOLDOWN:
+            signal = get_signal()
+            if signal:
+                send_proposal(signal)
 
-    if "proposal_open_contract" in data:
+    elif data.get("msg_type") == "proposal":
+        pid = data["proposal"]["id"]
+        ws.send(json.dumps({"buy": pid, "price": STAKE}))
+
+    elif data.get("msg_type") == "buy":
+        active_contract_id = data["buy"]["contract_id"]
+        log(f"🟢 BUY CONFIRMED {active_contract_id}")
+
+    elif data.get("msg_type") == "proposal_open_contract":
         c = data["proposal_open_contract"]
-        if c.get("is_sold"):
+        if c.get("contract_id") == active_contract_id and c.get("is_sold"):
             settle(c)
+
+    elif data.get("msg_type") == "balance":
+        BALANCE = float(data["balance"]["balance"])
 
 def on_open(ws):
     log("🌐 CONNECTED")
     ws.send(json.dumps({"authorize": API_TOKEN}))
 
-# ================= RUN =================
-if __name__ == "__main__":
-    log("🚀 DUAL SYMBOL BOT — V10 ⇄ V75 ACTIVE")
+def on_error(ws, err):
+    log(f"❌ WS ERROR: {err}")
+
+def on_close(ws, *args):
+    log("❌ WS CLOSED")
+
+# ===================== START =====================
+def start():
+    global ws
+    log("🚀 V10 CLOUD BOT — LIVE")
+
     ws = websocket.WebSocketApp(
         DERIV_WS,
         on_open=on_open,
-        on_message=on_message
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
     )
+
+    threading.Thread(target=trade_watchdog, daemon=True).start()
     ws.run_forever()
+
+if __name__ == "__main__":
+    start()
