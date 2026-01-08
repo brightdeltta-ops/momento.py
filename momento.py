@@ -13,7 +13,7 @@ V75 = "R_75"
 ACTIVE_SYMBOL = V10
 
 # ================= RISK =================
-BASE_STAKE = 1.0
+BASE_STAKE = 200.0
 STAKE_UP = 1.15
 MAX_STAKE_MULT = 3.0
 TRADE_DURATION = 1
