@@ -18,8 +18,8 @@ RISK_FRAC = 0.05
 MICRO_SLICE = 10
 EMA_FAST = 3
 EMA_SLOW = 10
-VOL_WINDOW = 15
-VOL_THRESHOLD = 0.00025
+VOL_WINDOW = 3        # reduced for fast firing
+VOL_THRESHOLD = 0.0   # allow any movement
 MAX_DD = 0.25
 LOSS_STREAK_LIMIT = 3
 STATE_FILE = "learner_state.pkl"
@@ -68,23 +68,15 @@ learner.load()
 
 # ================= UTILS =================
 def ema(data,p):
-    if len(data)<p: return data[-1] if len(data)>0 else 0.0
+    if len(data)<p: return 0.0
     w = np.exp(np.linspace(-1,0,p))
     w/=w.sum()
     return np.convolve(data[-p:],w,mode="valid")[0]
 
 def features():
-    if len(tick_buffer) < 2:  # early firing logic
-        a = np.array(tick_buffer)
-        return np.array([
-            a[-1] if len(a)>0 else 0,
-            a[-1] if len(a)>0 else 0,
-            (a[-1]-a[0]) if len(a)>1 else 0,
-            max(a.std() if len(a)>1 else 1e-6, 1e-6)
-        ])
-    else:
-        a = np.array(tick_buffer)
-        return np.array([ema(a,EMA_FAST), ema(a,EMA_SLOW), a[-1]-a[0], max(a.std(),1e-6)])
+    if len(tick_buffer)<MICRO_SLICE: return None
+    a = np.array(tick_buffer)
+    return np.array([ema(a,EMA_FAST),ema(a,EMA_SLOW),a[-1]-a[0],max(a.std(),1e-6)])
 
 def dynamic_stake(conf):
     stake = BASE_STAKE + conf*BALANCE*RISK_FRAC
@@ -99,13 +91,19 @@ def session_ok():
 def evaluate():
     global TRADE_AMOUNT,last_direction,trade_in_progress
     if trade_in_progress: return
-    if len(tick_history)<VOL_WINDOW: return
-    if np.std(list(tick_history)[-VOL_WINDOW:])<VOL_THRESHOLD: return
+    if len(tick_history)<min(VOL_WINDOW, MICRO_SLICE): return  # allow early ticks
+
     f = features()
     if f is None: return
+
     direction, conf = learner.predict(f)
-    if TRADE_COUNT<10: conf = 0.7
-    if len(tick_buffer)<MICRO_SLICE: conf *= len(tick_buffer)/MICRO_SLICE
+
+    # Force early trades
+    if TRADE_COUNT < 5: conf = max(conf, 0.3)
+
+    # Debug log
+    console.log(f"[yellow]STD={np.std(list(tick_history)[-VOL_WINDOW:]):.6f}, CONF={conf:.2f}, Direction={direction}[/yellow]")
+
     if conf<0.1: return
     TRADE_AMOUNT = dynamic_stake(conf)
     trade_queue.append((direction,1,TRADE_AMOUNT))
@@ -163,7 +161,7 @@ def start_ws():
                 tick_buffer.append(t)
                 evaluate()
             if "proposal" in d:
-                time.sleep(2)
+                time.sleep(1)
                 w.send(json.dumps({"buy":d["proposal"]["id"],"price":TRADE_AMOUNT}))
             if "proposal_open_contract" in d:
                 c=d["proposal_open_contract"]
