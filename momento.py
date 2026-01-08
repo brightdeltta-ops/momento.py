@@ -1,6 +1,5 @@
 import json
 import websocket
-import threading
 import time
 import os
 from collections import deque
@@ -24,8 +23,11 @@ EMA_FAST = 9
 EMA_SLOW = 21
 FRACTAL_LOOKBACK = 2
 
-COOLDOWN_SECONDS = 60       # 1 trade per candle
+COOLDOWN_SECONDS = 60        # 1 trade per candle
 MAX_HISTORY = 300
+
+MAX_CONSECUTIVE_LOSSES = 3  # 🔴 LOSS BREAKER
+LOSS_COOLDOWN = 900         # 15 minutes pause after breaker
 
 # =========================
 # STATE
@@ -35,6 +37,10 @@ in_trade = False
 last_trade_time = 0
 ws = None
 balance = 0
+
+loss_streak = 0
+breaker_active = False
+breaker_until = 0
 
 # =========================
 # UTIL
@@ -51,12 +57,10 @@ def ema(prices, period):
     prices = np.array(prices)
     weights = np.exp(np.linspace(-1., 0., period))
     weights /= weights.sum()
-    return np.convolve(prices, weights, mode='valid')[-1]
+    return np.convolve(prices, weights, mode="valid")[-1]
 
 def detect_fractal(prices):
-    prices = list(prices)
     L = FRACTAL_LOOKBACK
-
     if len(prices) < (L * 2 + 1):
         return None
 
@@ -74,17 +78,24 @@ def detect_fractal(prices):
 # TRADE ENGINE
 # =========================
 def try_trade():
-    global in_trade, last_trade_time
+    global in_trade, last_trade_time, breaker_active
+
+    now = time.time()
+
+    if breaker_active:
+        if now < breaker_until:
+            return
+        else:
+            breaker_active = False
+            print(f"{ts()} 🟢 Loss breaker released")
 
     if in_trade:
         return
 
-    now = time.time()
     if now - last_trade_time < COOLDOWN_SECONDS:
         return
 
     prices = list(price_history)
-
     fast = ema(prices, EMA_FAST)
     slow = ema(prices, EMA_SLOW)
     fractal = detect_fractal(prices)
@@ -93,7 +104,6 @@ def try_trade():
         return
 
     direction = None
-
     if fractal == "UP" and fast > slow:
         direction = "CALL"
     elif fractal == "DOWN" and fast < slow:
@@ -129,11 +139,18 @@ def send_trade(direction):
 # WEBSOCKET CALLBACKS
 # =========================
 def on_message(ws, message):
-    global in_trade, balance
+    global in_trade, balance, loss_streak, breaker_active, breaker_until
 
     data = json.loads(message)
 
-    if "tick" in data:
+    if "authorize" in data:
+        ws.send(json.dumps({
+            "ticks": SYMBOL,
+            "subscribe": 1
+        }))
+        print(f"{ts()} 📡 Subscribed to ticks {SYMBOL}")
+
+    elif "tick" in data:
         price = float(data["tick"]["quote"])
         price_history.append(price)
         try_trade()
@@ -145,8 +162,19 @@ def on_message(ws, message):
             profit = poc["profit"]
             balance = poc["balance_after"]
 
+            if profit < 0:
+                loss_streak += 1
+                print(f"{ts()} ❌ Loss streak {loss_streak}")
+            else:
+                loss_streak = 0
+
             print(f"{ts()} ✔ Settled | P/L {profit:.2f} | Bal {balance:.2f}")
             in_trade = False
+
+            if loss_streak >= MAX_CONSECUTIVE_LOSSES:
+                breaker_active = True
+                breaker_until = time.time() + LOSS_COOLDOWN
+                print(f"{ts()} 🔴 LOSS BREAKER ACTIVATED ({LOSS_COOLDOWN//60} min pause)")
 
 def on_open(ws):
     print(f"{ts()} ✅ Connected")
@@ -165,7 +193,6 @@ def on_close(ws, close_status_code, close_msg):
 # =========================
 def start_ws():
     global ws
-
     ws = websocket.WebSocketApp(
         f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}",
         on_open=on_open,
