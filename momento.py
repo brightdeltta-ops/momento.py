@@ -3,173 +3,140 @@ import time
 import threading
 import websocket
 import os
-from collections import deque
+from datetime import datetime
 
-# ===================== CONFIG =====================
+# ================= CONFIG =================
 API_TOKEN = os.getenv("DERIV_API_TOKEN")
-APP_ID = int(os.getenv("APP_ID", "112380"))
+APP_ID = int(os.getenv("APP_ID", "1089"))
 
-SYMBOL = "R_10"          # V10 sniper
+SYMBOL = "R_10"
+DURATION = 1
 BASE_STAKE = 200.0
-MAX_STAKE = 500.0
-TRADE_DURATION = 1       # ticks
-COOLDOWN = 5             # seconds between trades
-
-EMA_FAST = 9
-EMA_SLOW = 21
+MAX_STAKE = 250.0
+COOLDOWN = 1.3
 
 DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
-# ===================== STATE =====================
-ticks = deque(maxlen=200)
-
-BALANCE = 0.0
-STAKE = BASE_STAKE
-WINS = 0
-LOSSES = 0
-TRADES = 0
-
-trade_open = False
-last_trade_time = 0
-active_contract_id = None
-
+# ================= STATE =================
 ws = None
+trade_in_progress = False
+last_trade_time = 0
+stake = BASE_STAKE
+current_contract = None
 
-# ===================== LOG =====================
+# ================= LOG =================
 def log(msg):
-    print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
+    print(f"{datetime.now().strftime('%H:%M:%S')} {msg}", flush=True)
 
-# ===================== EMA =====================
-def ema(values, period):
-    if len(values) < period:
-        return None
-    k = 2 / (period + 1)
-    ema_val = values[0]
-    for v in values[1:]:
-        ema_val = v * k + ema_val * (1 - k)
-    return ema_val
+# ================= TRADE LOGIC =================
+def can_trade():
+    return (not trade_in_progress) and (time.time() - last_trade_time > COOLDOWN)
 
-# ===================== STRATEGY =====================
-def get_signal():
-    if len(ticks) < EMA_SLOW + 3:
-        return None
-
-    price = ticks[-1]
-    ef = ema(list(ticks)[-EMA_FAST:], EMA_FAST)
-    es = ema(list(ticks)[-EMA_SLOW:], EMA_SLOW)
-
-    if ef is None or es is None:
-        return None
-
-    if ef > es and price > ef:
-        return "CALL"
-    if ef < es and price < ef:
-        return "PUT"
-
-    return None
-
-# ===================== TRADE =====================
 def send_proposal(direction):
-    global trade_open, last_trade_time
+    global trade_in_progress, last_trade_time, stake
+
+    if not can_trade():
+        return
+
+    trade_in_progress = True
+    last_trade_time = time.time()
+    stake = min(stake, MAX_STAKE)
+
+    log(f"🎯 {SYMBOL} {direction} | STAKE {stake:.2f}")
 
     proposal = {
         "proposal": 1,
-        "amount": STAKE,
+        "amount": stake,
         "basis": "stake",
-        "contract_type": direction,
+        "contract_type": "CALL" if direction == "CALL" else "PUT",
         "currency": "USD",
-        "duration": TRADE_DURATION,
+        "duration": DURATION,
         "duration_unit": "t",
         "symbol": SYMBOL
     }
 
-    trade_open = True
-    last_trade_time = time.time()
     ws.send(json.dumps(proposal))
 
-    log(f"🎯 {SYMBOL} {direction} | STAKE {STAKE:.2f}")
-
-# ===================== WATCHDOG =====================
-def trade_watchdog():
-    global trade_open
-    while True:
-        time.sleep(1)
-        if trade_open and time.time() - last_trade_time > 8:
-            log("⚠ FORCE RELEASE — NO SETTLEMENT")
-            trade_open = False
-
-# ===================== SETTLEMENT =====================
-def settle(contract):
-    global BALANCE, STAKE, WINS, LOSSES, TRADES, trade_open, active_contract_id
-
-    profit = float(contract.get("profit", 0))
-    BALANCE += profit
-    TRADES += 1
-
-    if profit > 0:
-        WINS += 1
-        STAKE = min(STAKE * 1.15, MAX_STAKE)
-        log(f"✔ WIN {profit:.2f} → {STAKE:.2f}")
-    else:
-        LOSSES += 1
-        STAKE = BASE_STAKE
-        log(f"❌ LOSS {profit:.2f} → RESET")
-
-    trade_open = False
-    active_contract_id = None
-
-# ===================== WS HANDLER =====================
-def on_message(ws, msg):
-    global BALANCE, active_contract_id
-
-    data = json.loads(msg)
-
-    if data.get("msg_type") == "authorize":
-        ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
-        ws.send(json.dumps({"balance": 1, "subscribe": 1}))
-        ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
-        log("🔐 AUTHORIZED")
-
-    elif data.get("msg_type") == "tick":
-        price = float(data["tick"]["quote"])
-        ticks.append(price)
-
-        if not trade_open and time.time() - last_trade_time > COOLDOWN:
-            signal = get_signal()
-            if signal:
-                send_proposal(signal)
-
-    elif data.get("msg_type") == "proposal":
-        pid = data["proposal"]["id"]
-        ws.send(json.dumps({"buy": pid, "price": STAKE}))
-
-    elif data.get("msg_type") == "buy":
-        active_contract_id = data["buy"]["contract_id"]
-        log(f"🟢 BUY CONFIRMED {active_contract_id}")
-
-    elif data.get("msg_type") == "proposal_open_contract":
-        c = data["proposal_open_contract"]
-        if c.get("contract_id") == active_contract_id and c.get("is_sold"):
-            settle(c)
-
-    elif data.get("msg_type") == "balance":
-        BALANCE = float(data["balance"]["balance"])
-
-def on_open(ws):
+# ================= WS HANDLERS =================
+def on_open(socket):
     log("🌐 CONNECTED")
-    ws.send(json.dumps({"authorize": API_TOKEN}))
+    socket.send(json.dumps({"authorize": API_TOKEN}))
 
-def on_error(ws, err):
-    log(f"❌ WS ERROR: {err}")
+def on_message(socket, message):
+    global trade_in_progress, stake, current_contract
 
-def on_close(ws, *args):
-    log("❌ WS CLOSED")
+    data = json.loads(message)
+    msg_type = data.get("msg_type")
 
-# ===================== START =====================
-def start():
+    # AUTH
+    if msg_type == "authorize":
+        log("🔐 AUTHORIZED")
+        return
+
+    # PROPOSAL RESPONSE
+    if msg_type == "proposal":
+        if "error" in data:
+            log(f"❌ PROPOSAL REJECTED: {data['error']['message']}")
+            trade_in_progress = False
+            return
+
+        proposal = data.get("proposal")
+        if not proposal or "id" not in proposal:
+            log("⚠ INVALID PROPOSAL — SKIPPED")
+            trade_in_progress = False
+            return
+
+        pid = proposal["id"]
+        ws.send(json.dumps({"buy": pid, "price": proposal["ask_price"]}))
+        log(f"🟢 BUY CONFIRMED {pid}")
+        return
+
+    # BUY CONFIRM
+    if msg_type == "buy":
+        current_contract = data["buy"]["contract_id"]
+        ws.send(json.dumps({
+            "proposal_open_contract": 1,
+            "contract_id": current_contract,
+            "subscribe": 1
+        }))
+        return
+
+    # CONTRACT UPDATE
+    if msg_type == "proposal_open_contract":
+        poc = data["proposal_open_contract"]
+        if poc.get("is_sold"):
+            profit = float(poc.get("profit", 0))
+
+            if profit > 0:
+                stake += profit
+                log(f"✔ WIN {profit:.2f} → {stake:.2f}")
+            else:
+                log(f"❌ LOSS {profit:.2f} → RESET")
+                stake = BASE_STAKE
+
+            trade_in_progress = False
+            current_contract = None
+            return
+
+def on_error(socket, error):
+    log(f"❌ WS ERROR: {error}")
+
+def on_close(socket):
+    log("🔁 WS CLOSED — RECONNECTING")
+    time.sleep(2)
+    start_bot()
+
+# ================= STRATEGY LOOP =================
+def strategy_loop():
+    while True:
+        if can_trade():
+            direction = "CALL" if int(time.time()) % 2 == 0 else "PUT"
+            send_proposal(direction)
+        time.sleep(0.2)
+
+# ================= START =================
+def start_bot():
     global ws
-    log("🚀 V10 CLOUD BOT — LIVE")
-
     ws = websocket.WebSocketApp(
         DERIV_WS,
         on_open=on_open,
@@ -177,9 +144,12 @@ def start():
         on_error=on_error,
         on_close=on_close
     )
-
-    threading.Thread(target=trade_watchdog, daemon=True).start()
-    ws.run_forever()
+    threading.Thread(target=ws.run_forever, daemon=True).start()
 
 if __name__ == "__main__":
-    start()
+    log("🚀 V10 CLOUD BOT — LIVE")
+    start_bot()
+    threading.Thread(target=strategy_loop, daemon=True).start()
+
+    while True:
+        time.sleep(1)
