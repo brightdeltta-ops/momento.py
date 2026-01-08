@@ -1,206 +1,167 @@
-import os, json, time, threading
+import json
 import websocket
+import threading
+import time
+import os
 from collections import deque
+import numpy as np
+from datetime import datetime
 
-# ================= CONFIG =================
-TOKEN = os.getenv("DERIV_API_TOKEN")
+# =========================
+# CONFIG
+# =========================
+API_TOKEN = os.getenv("DERIV_API_TOKEN")
 APP_ID = int(os.getenv("APP_ID", "1089"))
-
-SYMBOL = "R_75"
-BASE_STAKE = 200.0
-TRADE_DURATION = 1
+SYMBOL = "frxUSDJPY"
+STAKE = 200
+DURATION = 1
+DURATION_UNIT = "m"
 
 EMA_FAST = 9
 EMA_SLOW = 21
-FRACTAL_LOOKBACK = 5
+FRACTAL_LOOKBACK = 2
+COOLDOWN_SECONDS = 5
+MAX_HISTORY = 200
 
-MAX_SESSION_LOSS = 5050.0
-FREEZE_TIMEOUT = 5
-
-DERIV_WS = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-
-# ================= STATE =================
-ticks = deque(maxlen=500)
-trade_queue = deque(maxlen=5)
-
-BALANCE = 0.0
-WINS = LOSSES = TRADES = 0
-
-trade_open = False
+# =========================
+# STATE
+# =========================
+price_history = deque(maxlen=MAX_HISTORY)
+in_trade = False
 last_trade_time = 0
-last_proposal_time = 0
-
 ws = None
+balance = 0
 
-# ================= LOG =================
-def log(msg):
-    print(time.strftime("%H:%M:%S"), msg, flush=True)
-
-# ================= INDICATORS =================
-def ema_from_list(prices, period):
+# =========================
+# INDICATORS
+# =========================
+def ema(prices, period):
     if len(prices) < period:
         return None
-    k = 2 / (period + 1)
-    ema_val = prices[-period]
-    for p in prices[-period + 1:]:
-        ema_val = p * k + ema_val * (1 - k)
-    return ema_val
+    prices = np.array(prices)
+    weights = np.exp(np.linspace(-1., 0., period))
+    weights /= weights.sum()
+    return np.convolve(prices, weights, mode='valid')[-1]
 
-def micro_fractal(prices):
-    if len(prices) < FRACTAL_LOOKBACK + 2:
+def detect_fractal(prices):
+    prices = list(prices)
+    if len(prices) < FRACTAL_LOOKBACK * 2 + 1:
         return None
 
-    recent = prices[-FRACTAL_LOOKBACK-2:-2]
-    hi = max(recent)
-    lo = min(recent)
-    last = prices[-1]
+    mid = prices[-FRACTAL_LOOKBACK-1]
+    left = prices[-(FRACTAL_LOOKBACK*2+1):-FRACTAL_LOOKBACK-1]
+    right = prices[-FRACTAL_LOOKBACK:]
 
-    if last > hi:
-        return "up"
-    if last < lo:
-        return "down"
+    if mid > max(left + right):
+        return "UP"
+    if mid < min(left + right):
+        return "DOWN"
     return None
 
-def trade_signal():
-    prices = list(ticks)
-    if len(prices) < EMA_SLOW + 5:
-        return None
+# =========================
+# TRADE LOGIC
+# =========================
+def try_trade():
+    global in_trade, last_trade_time
 
-    ef = ema_from_list(prices, EMA_FAST)
-    es = ema_from_list(prices, EMA_SLOW)
-    fractal = micro_fractal(prices)
-    price = prices[-1]
-
-    if ef is None or es is None or not fractal:
-        return None
-
-    if fractal == "up" and ef > es and price > ef:
-        return "up"
-    if fractal == "down" and ef < es and price < ef:
-        return "down"
-
-    return None
-
-# ================= SAFETY =================
-def session_loss_ok():
-    return LOSSES * BASE_STAKE < MAX_SESSION_LOSS
-
-def auto_unfreeze():
-    global trade_open
-    while True:
-        time.sleep(2)
-        if trade_open and time.time() - last_trade_time > FREEZE_TIMEOUT:
-            trade_open = False
-            log("⚠ Auto-unfreeze triggered")
-
-# ================= EXECUTION =================
-def evaluate():
-    global last_proposal_time
-
-    if trade_open:
-        return
-    if not session_loss_ok():
-        return
-    if time.time() - last_proposal_time < 0.4:
+    if in_trade:
         return
 
-    direction = trade_signal()
+    now = time.time()
+    if now - last_trade_time < COOLDOWN_SECONDS:
+        return
+
+    prices = list(price_history)
+    fast = ema(prices, EMA_FAST)
+    slow = ema(prices, EMA_SLOW)
+    fractal = detect_fractal(prices)
+
+    if not fast or not slow or not fractal:
+        return
+
+    direction = None
+
+    if fractal == "UP" and fast > slow:
+        direction = "CALL"
+    elif fractal == "DOWN" and fast < slow:
+        direction = "PUT"
+
     if not direction:
         return
 
-    trade_queue.append(direction)
-    last_proposal_time = time.time()
-    log(f"🎯 FRACTAL+EMA → {direction.upper()}")
-    process_queue()
+    print(f"{ts()} 🎯 FRACTAL+EMA → {direction}")
 
-def process_queue():
-    global trade_open, last_trade_time
-    if trade_queue and not trade_open:
-        direction = trade_queue.popleft()
-        ct = "CALL" if direction == "up" else "PUT"
+    send_trade(direction)
+    in_trade = True
+    last_trade_time = now
 
-        ws.send(json.dumps({
-            "proposal": 1,
-            "amount": BASE_STAKE,
+def send_trade(direction):
+    proposal = {
+        "buy": 1,
+        "price": STAKE,
+        "parameters": {
+            "amount": STAKE,
             "basis": "stake",
-            "contract_type": ct,
+            "contract_type": direction,
             "currency": "USD",
-            "duration": TRADE_DURATION,
-            "duration_unit": "t",
+            "duration": DURATION,
+            "duration_unit": DURATION_UNIT,
             "symbol": SYMBOL
-        }))
+        }
+    }
+    ws.send(json.dumps(proposal))
+    print(f"{ts()} 📨 Proposal {direction}")
 
-        trade_open = True
-        last_trade_time = time.time()
-        log(f"📨 Proposal {ct}")
-
-# ================= WS HANDLERS =================
-def on_open(ws):
-    ws.send(json.dumps({"authorize": TOKEN}))
-
-def on_message(ws, msg):
-    global BALANCE, trade_open, WINS, LOSSES, TRADES
-
-    data = json.loads(msg)
-
-    if "authorize" in data:
-        log("✅ Authorized")
-        ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
-        ws.send(json.dumps({"balance": 1, "subscribe": 1}))
-        ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
+# =========================
+# WEBSOCKET HANDLERS
+# =========================
+def on_message(ws, message):
+    global in_trade, balance
+    data = json.loads(message)
 
     if "tick" in data:
-        ticks.append(float(data["tick"]["quote"]))
-        evaluate()
+        price = float(data["tick"]["quote"])
+        price_history.append(price)
+        try_trade()
 
-    if "proposal" in data:
-        ws.send(json.dumps({
-            "buy": data["proposal"]["id"],
-            "price": BASE_STAKE
-        }))
+    elif "buy" in data:
+        pass
 
-    if "proposal_open_contract" in data:
-        c = data["proposal_open_contract"]
-        if c.get("is_sold") or c.get("is_expired"):
-            profit = float(c.get("profit") or 0)
-            BALANCE += profit
-            TRADES += 1
-            trade_open = False
+    elif "proposal_open_contract" in data:
+        contract = data["proposal_open_contract"]
+        if contract.get("is_sold"):
+            profit = contract["profit"]
+            balance = contract["balance_after"]
+            print(f"{ts()} ✔ Settled | P/L {profit:.2f} | Bal {balance:.2f}")
+            in_trade = False
 
-            if profit > 0:
-                WINS += 1
-            else:
-                LOSSES += 1
+def on_open(ws):
+    ws.send(json.dumps({"authorize": API_TOKEN}))
 
-            log(f"✔ Settled | P/L {profit:.2f} | Bal {BALANCE:.2f}")
-            process_queue()
+def on_error(ws, error):
+    print(f"{ts()} ❌ WS Error {error}")
 
-    if "balance" in data:
-        BALANCE = float(data["balance"]["balance"])
-
-def on_error(ws, err):
-    log(f"❌ WS Error {err}")
-
-def on_close(ws, *_):
-    log("❌ WS Closed — reconnecting")
+def on_close(ws):
+    print(f"{ts()} ❌ WS Closed — reconnecting")
     time.sleep(2)
     start_ws()
 
-# ================= START =================
+# =========================
+# START
+# =========================
 def start_ws():
     global ws
     ws = websocket.WebSocketApp(
-        DERIV_WS,
+        f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}",
         on_open=on_open,
         on_message=on_message,
         on_error=on_error,
         on_close=on_close
     )
-    threading.Thread(target=ws.run_forever, daemon=True).start()
+    ws.run_forever()
 
-log("🚀 FRACTAL EMA BOT — KOYEB STABLE")
-start_ws()
-threading.Thread(target=auto_unfreeze, daemon=True).start()
+def ts():
+    return datetime.now().strftime("%H:%M:%S")
 
-while True:
-    time.sleep(1)
+if __name__ == "__main__":
+    start_ws()
