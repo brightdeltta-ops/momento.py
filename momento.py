@@ -26,8 +26,8 @@ FRACTAL_LOOKBACK = 2
 COOLDOWN_SECONDS = 60        # 1 trade per candle
 MAX_HISTORY = 300
 
-MAX_CONSECUTIVE_LOSSES = 3  # 🔴 LOSS BREAKER
-LOSS_COOLDOWN = 900         # 15 minutes pause after breaker
+MAX_CONSECUTIVE_LOSSES = 3  # LOSS BREAKER
+LOSS_COOLDOWN = 900         # 15 minutes pause
 
 # =========================
 # STATE
@@ -41,6 +41,9 @@ balance = 0
 loss_streak = 0
 breaker_active = False
 breaker_until = 0
+
+tick_count = 0
+last_heartbeat = 0
 
 # =========================
 # UTIL
@@ -85,9 +88,8 @@ def try_trade():
     if breaker_active:
         if now < breaker_until:
             return
-        else:
-            breaker_active = False
-            print(f"{ts()} 🟢 Loss breaker released")
+        breaker_active = False
+        print(f"{ts()} 🟢 Loss breaker released")
 
     if in_trade:
         return
@@ -140,6 +142,7 @@ def send_trade(direction):
 # =========================
 def on_message(ws, message):
     global in_trade, balance, loss_streak, breaker_active, breaker_until
+    global tick_count, last_heartbeat
 
     data = json.loads(message)
 
@@ -153,6 +156,13 @@ def on_message(ws, message):
     elif "tick" in data:
         price = float(data["tick"]["quote"])
         price_history.append(price)
+        tick_count += 1
+
+        now = time.time()
+        if now - last_heartbeat > 10:
+            print(f"{ts()} ❤️ Heartbeat | Ticks {tick_count}")
+            last_heartbeat = now
+
         try_trade()
 
     elif "proposal_open_contract" in data:
@@ -200,11 +210,7 @@ def start_ws():
         on_error=on_error,
         on_close=on_close
     )
-
-    ws.run_forever(
-        ping_interval=30,
-        ping_timeout=10
-    )
+    ws.run_forever(ping_interval=30, ping_timeout=10)
 
 # =========================
 # MAIN
